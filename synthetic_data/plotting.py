@@ -488,29 +488,36 @@ def plot_psd_panel(
     return dataset
 
 
-def _build_amplitude_noise_grid_trials(
+def _build_multifactor_grid_trials(
     amplitudes_nam: Sequence[float],
+    source_frequencies_hz: Sequence[float],
+    phases_pi: Sequence[float],
     noise_std_multipliers: Sequence[float],
-    source_freq_hz: float,
     n_repeats: int,
 ) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
-    for noise_id, noise_std_multiplier in enumerate(noise_std_multipliers):
-        for amplitude_id, amplitude_nam in enumerate(amplitudes_nam):
-            setting_id = noise_id * len(amplitudes_nam) + amplitude_id
-            for sample_id in range(n_repeats):
-                rows.append(
-                    {
-                        "setting_id": setting_id,
-                        "noise_id": noise_id,
-                        "amplitude_id": amplitude_id,
-                        "sample_id": sample_id,
-                        "source_freq_hz": float(source_freq_hz),
-                        "amplitude_nam": float(amplitude_nam),
-                        "phase_rad": 0.0,
-                        "noise_std_multiplier": float(noise_std_multiplier),
-                    }
-                )
+    setting_id = 0
+    for amplitude_id, amplitude_nam in enumerate(amplitudes_nam):
+        for noise_id, noise_std_multiplier in enumerate(noise_std_multipliers):
+            for phase_id, phase_pi in enumerate(phases_pi):
+                for frequency_id, source_freq_hz in enumerate(source_frequencies_hz):
+                    for sample_id in range(n_repeats):
+                        rows.append(
+                            {
+                                "setting_id": setting_id,
+                                "amplitude_id": amplitude_id,
+                                "noise_id": noise_id,
+                                "phase_id": phase_id,
+                                "frequency_id": frequency_id,
+                                "sample_id": sample_id,
+                                "source_freq_hz": float(source_freq_hz),
+                                "amplitude_nam": float(amplitude_nam),
+                                "phase_rad": float(phase_pi) * np.pi,
+                                "phase_pi": float(phase_pi),
+                                "noise_std_multiplier": float(noise_std_multiplier),
+                            }
+                        )
+                    setting_id += 1
     return rows
 
 
@@ -518,10 +525,32 @@ def _format_powerlaw_label(beta: float) -> str:
     return f"PSD~f^-{float(beta):g}"
 
 
+def _format_phase_pi(phase_pi: float) -> str:
+    return f"{float(phase_pi):g} pi"
+
+
+def _float_path_token(value: float) -> str:
+    return f"{float(value):g}".replace("-", "m").replace(".", "p")
+
+
+def _grid_output_path(
+    output: str, amplitudes_nam: Sequence[float], amplitude_nam: float
+) -> Path:
+    output_path = Path(output)
+    if len(amplitudes_nam) == 1:
+        return output_path
+    token = _float_path_token(amplitude_nam)
+    return output_path.with_name(
+        f"{output_path.stem}_amp_{token}nam{output_path.suffix}"
+    )
+
+
 def _write_psd_parameter_grid(
     dataset: SyntheticSourceDataset,
     output: str,
     amplitudes_nam: Sequence[float],
+    source_frequencies_hz: Sequence[float],
+    phases_pi: Sequence[float],
     noise_std_multipliers: Sequence[float],
     noise_mode: str,
     noise_powerlaw_beta: float,
@@ -543,14 +572,6 @@ def _write_psd_parameter_grid(
     if int(freq_mask.sum()) < 3:
         raise ValueError("PSD frequency range must contain at least 3 bins")
 
-    fig, axes = plt.subplots(
-        len(noise_std_multipliers),
-        len(amplitudes_nam),
-        figsize=(3.35 * len(amplitudes_nam), 2.35 * len(noise_std_multipliers)),
-        sharex=True,
-        constrained_layout=True,
-        squeeze=False,
-    )
     sample_color = "#78aeb7"
     mean_color = "#0f6b78"
     reference_color = "0.35"
@@ -564,76 +585,97 @@ def _write_psd_parameter_grid(
         dataset.sfreq,
     )
 
-    for row_idx, noise_std_multiplier in enumerate(noise_std_multipliers):
-        for col_idx, amplitude_nam in enumerate(amplitudes_nam):
-            ax = axes[row_idx, col_idx]
-            trial_indices = [
-                idx
-                for idx, row in enumerate(dataset.metadata)
-                if int(row["noise_id"]) == row_idx
-                and int(row["amplitude_id"]) == col_idx
-            ]
-            sample_psd = psd[trial_indices].mean(axis=1)
-            mean_psd = sample_psd.mean(axis=0)
-            for sample in sample_psd:
+    written_paths: List[Path] = []
+    for amplitude_id, amplitude_nam in enumerate(amplitudes_nam):
+        fig, axes = plt.subplots(
+            len(noise_std_multipliers),
+            len(source_frequencies_hz),
+            figsize=(
+                3.35 * len(source_frequencies_hz),
+                2.35 * len(noise_std_multipliers),
+            ),
+            sharex=True,
+            constrained_layout=True,
+            squeeze=False,
+        )
+
+        for row_idx, noise_std_multiplier in enumerate(noise_std_multipliers):
+            for col_idx, source_frequency_hz in enumerate(source_frequencies_hz):
+                ax = axes[row_idx, col_idx]
+                trial_indices = [
+                    idx
+                    for idx, row in enumerate(dataset.metadata)
+                    if int(row["amplitude_id"]) == amplitude_id
+                    and int(row["noise_id"]) == row_idx
+                    and int(row["frequency_id"]) == col_idx
+                ]
+                if not trial_indices:
+                    raise ValueError("PSD grid could not find matching trials")
+
+                sample_psd = psd[trial_indices].mean(axis=1)
+                mean_psd = sample_psd.mean(axis=0)
+                for sample in sample_psd:
+                    ax.plot(
+                        freqs[freq_mask],
+                        sample[freq_mask],
+                        color=sample_color,
+                        alpha=0.4,
+                        linewidth=0.7,
+                    )
                 ax.plot(
                     freqs[freq_mask],
-                    sample[freq_mask],
-                    color=sample_color,
-                    alpha=0.45,
-                    linewidth=0.7,
+                    mean_psd[freq_mask],
+                    color=mean_color,
+                    linewidth=1.4,
                 )
-            ax.plot(
-                freqs[freq_mask],
-                mean_psd[freq_mask],
-                color=mean_color,
-                linewidth=1.4,
-            )
 
-            source_freq_hz = float(dataset.metadata[trial_indices[0]]["source_freq_hz"])
-            one_over_f = _one_over_f_reference(
-                freqs,
-                mean_psd,
-                freq_mask,
-                source_freq_hz=source_freq_hz,
-            )
-            ax.plot(
-                freqs[freq_mask],
-                one_over_f,
-                color=reference_color,
-                linestyle="--",
-                linewidth=0.8,
-            )
-            ax.axvline(source_freq_hz, color="0.25", alpha=0.2, linewidth=0.7)
-            ax.set_xlim(fmin, fmax)
-            ax.set_ylim(bottom=0.0)
-            ax.grid(color="0.9", linewidth=0.6)
-            ax.spines["top"].set_visible(False)
-            ax.spines["right"].set_visible(False)
-
-            if row_idx == 0:
-                ax.set_title(f"amplitude={float(amplitude_nam):g} nAm", fontsize=9)
-            if col_idx == 0:
-                ax.set_ylabel(
-                    f"noise_std x{float(noise_std_multiplier):g}\n(uV^2/Hz)",
-                    fontsize=8,
+                source_freq_hz = float(source_frequency_hz)
+                one_over_f = _one_over_f_reference(
+                    freqs,
+                    mean_psd,
+                    freq_mask,
+                    source_freq_hz=source_freq_hz,
                 )
-            if row_idx == len(noise_std_multipliers) - 1:
-                ax.set_xlabel("Frequency (Hz)")
+                ax.plot(
+                    freqs[freq_mask],
+                    one_over_f,
+                    color=reference_color,
+                    linestyle="--",
+                    linewidth=0.8,
+                )
+                ax.axvline(source_freq_hz, color="0.25", alpha=0.2, linewidth=0.7)
+                ax.set_xlim(fmin, fmax)
+                ax.set_ylim(bottom=0.0)
+                ax.grid(color="0.9", linewidth=0.6)
+                ax.spines["top"].set_visible(False)
+                ax.spines["right"].set_visible(False)
 
-    title = (
-        f"Linear PSD grid ({dataset.montage}, {dataset.noise_mode} covariance, "
-        f"temporal {_format_powerlaw_label(noise_powerlaw_beta)}, "
-        f"source_freq={dataset.metadata[0]['source_freq_hz']:g} Hz)"
-    )
-    fig.suptitle(title, fontsize=12)
-    output_path = Path(output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=180)
-    if show:
-        plt.show()
-    else:
-        plt.close(fig)
+                if row_idx == 0:
+                    ax.set_title(f"source_freq={source_freq_hz:g} Hz", fontsize=9)
+                if col_idx == 0:
+                    ax.set_ylabel(
+                        f"noise_std x{float(noise_std_multiplier):g}\n(uV^2/Hz)",
+                        fontsize=8,
+                    )
+                if row_idx == len(noise_std_multipliers) - 1:
+                    ax.set_xlabel("Frequency (Hz)")
+
+        title = (
+            f"PSD grid: amplitude={float(amplitude_nam):g} nAm\n"
+            f"{dataset.montage}, {dataset.noise_mode}, "
+            f"{_format_powerlaw_label(noise_powerlaw_beta)}, "
+            f"{len(phases_pi)} phases averaged"
+        )
+        fig.suptitle(title, fontsize=11)
+        output_path = _grid_output_path(output, amplitudes_nam, amplitude_nam)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path, dpi=180)
+        written_paths.append(output_path)
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
+    dataset.generated_plot_paths = [str(path) for path in written_paths]
 
 
 def plot_psd_parameter_grid(
@@ -646,21 +688,15 @@ def plot_psd_parameter_grid(
     subjects_dir: Optional[str] = None,
     fetch_fsaverage: bool = True,
     random_state: int = 0,
-    n_repeats: int = 4,
+    n_repeats: int = 1,
     n_plot_channels: int = 8,
     noise_mode: str = "spatial_distance",
     noise_iir_filter: Optional[Sequence[float]] = (0.2, -0.2, 0.04),
     spatial_noise_length_scale_cm: float = 6.0,
-    grid_source_freq_hz: float = 10.0,
-    grid_amplitudes_nam: Sequence[float] = (
-        0.01,
-        0.05,
-        0.1,
-        0.15,
-        0.2,
-        0.5,
-    ),
-    grid_noise_std_multipliers: Sequence[float] = (1.0, 2.0, 5.0, 10.0, 15.0),
+    grid_source_frequencies_hz: Sequence[float] = (5.0, 10.0, 18.0),
+    grid_amplitudes_nam: Sequence[float] = (0.001, 0.01, 0.1),
+    grid_phases_pi: Sequence[float] = (0.0, 0.5, 1.0),
+    grid_noise_std_multipliers: Sequence[float] = (1.0, 5.0, 15.0),
     noise_powerlaw_beta: float = 1.0,
     psd_fmin: float = 1.0,
     psd_fmax: float = 80.0,
@@ -673,10 +709,11 @@ def plot_psd_parameter_grid(
             "or noise_mode='spatial_distance'"
         )
 
-    trial_parameters = _build_amplitude_noise_grid_trials(
+    trial_parameters = _build_multifactor_grid_trials(
         amplitudes_nam=grid_amplitudes_nam,
+        source_frequencies_hz=grid_source_frequencies_hz,
+        phases_pi=grid_phases_pi,
         noise_std_multipliers=grid_noise_std_multipliers,
-        source_freq_hz=grid_source_freq_hz,
         n_repeats=n_repeats,
     )
     dataset = SyntheticSourceDataset(
@@ -700,6 +737,8 @@ def plot_psd_parameter_grid(
         dataset=dataset,
         output=output,
         amplitudes_nam=grid_amplitudes_nam,
+        source_frequencies_hz=grid_source_frequencies_hz,
+        phases_pi=grid_phases_pi,
         noise_std_multipliers=grid_noise_std_multipliers,
         noise_mode=normalized_noise_mode,
         noise_powerlaw_beta=noise_powerlaw_beta,
@@ -716,6 +755,8 @@ def _write_waveform_parameter_grid(
     dataset: SyntheticSourceDataset,
     output: str,
     amplitudes_nam: Sequence[float],
+    source_frequencies_hz: Sequence[float],
+    phases_pi: Sequence[float],
     noise_std_multipliers: Sequence[float],
     noise_mode: str,
     noise_powerlaw_beta: float,
@@ -725,15 +766,6 @@ def _write_waveform_parameter_grid(
 ) -> None:
     plot_channel_indices = _choose_plot_channels(dataset, n_plot_channels)
     plot_channel_indices = plot_channel_indices[: min(len(plot_channel_indices), 6)]
-
-    fig, axes = plt.subplots(
-        len(noise_std_multipliers),
-        len(amplitudes_nam),
-        figsize=(3.35 * len(amplitudes_nam), 2.35 * len(noise_std_multipliers)),
-        sharex=True,
-        constrained_layout=True,
-        squeeze=False,
-    )
     color = "#0f6b78"
 
     dataset.noise_mode = dataset._normalize_noise_mode(noise_mode)
@@ -746,57 +778,84 @@ def _write_waveform_parameter_grid(
     offset = trace_scale * 3.8
     y_offsets = offset * np.arange(len(plot_channel_indices))[::-1]
 
-    for row_idx, noise_std_multiplier in enumerate(noise_std_multipliers):
-        for col_idx, amplitude_nam in enumerate(amplitudes_nam):
-            ax = axes[row_idx, col_idx]
-            trial_indices = [
-                idx
-                for idx, row in enumerate(dataset.metadata)
-                if int(row["noise_id"]) == row_idx
-                and int(row["amplitude_id"]) == col_idx
-                and int(row["sample_id"]) == 0
-            ]
-            if not trial_indices:
-                raise ValueError("Waveform grid could not find sample_id=0")
+    written_paths: List[Path] = []
+    n_rows = len(noise_std_multipliers) * len(phases_pi)
+    for amplitude_id, amplitude_nam in enumerate(amplitudes_nam):
+        fig, axes = plt.subplots(
+            n_rows,
+            len(source_frequencies_hz),
+            figsize=(3.35 * len(source_frequencies_hz), 1.65 * n_rows),
+            sharex=True,
+            constrained_layout=True,
+            squeeze=False,
+        )
 
-            sample_uv = dataset.X[trial_indices[0], plot_channel_indices, :] * 1e6
-            for channel_row, trace in enumerate(sample_uv):
-                ax.plot(
-                    dataset.times,
-                    trace + y_offsets[channel_row],
-                    color=color,
-                    linewidth=0.8,
-                )
+        for noise_id, noise_std_multiplier in enumerate(noise_std_multipliers):
+            for phase_id, phase_pi in enumerate(phases_pi):
+                row_idx = noise_id * len(phases_pi) + phase_id
+                for col_idx, source_frequency_hz in enumerate(source_frequencies_hz):
+                    ax = axes[row_idx, col_idx]
+                    trial_indices = [
+                        idx
+                        for idx, row in enumerate(dataset.metadata)
+                        if int(row["amplitude_id"]) == amplitude_id
+                        and int(row["noise_id"]) == noise_id
+                        and int(row["phase_id"]) == phase_id
+                        and int(row["frequency_id"]) == col_idx
+                        and int(row["sample_id"]) == 0
+                    ]
+                    if not trial_indices:
+                        raise ValueError("Waveform grid could not find sample_id=0")
 
-            ax.set_yticks([])
-            ax.set_ylim(y_offsets[-1] - 2.0 * offset, y_offsets[0] + 2.0 * offset)
-            ax.grid(axis="x", color="0.9", linewidth=0.6)
-            ax.spines["top"].set_visible(False)
-            ax.spines["right"].set_visible(False)
+                    sample_uv = dataset.X[
+                        trial_indices[0], plot_channel_indices, :
+                    ] * 1e6
+                    for channel_row, trace in enumerate(sample_uv):
+                        ax.plot(
+                            dataset.times,
+                            trace + y_offsets[channel_row],
+                            color=color,
+                            linewidth=0.75,
+                        )
 
-            if row_idx == 0:
-                ax.set_title(f"amplitude={float(amplitude_nam):g} nAm", fontsize=9)
-            if col_idx == 0:
-                ax.set_ylabel(
-                    f"noise_std x{float(noise_std_multiplier):g}",
-                    fontsize=8,
-                )
-            if row_idx == len(noise_std_multipliers) - 1:
-                ax.set_xlabel("Time (s)")
+                    ax.set_yticks([])
+                    ax.set_ylim(
+                        y_offsets[-1] - 2.0 * offset,
+                        y_offsets[0] + 2.0 * offset,
+                    )
+                    ax.grid(axis="x", color="0.9", linewidth=0.6)
+                    ax.spines["top"].set_visible(False)
+                    ax.spines["right"].set_visible(False)
 
-    title = (
-        f"Waveform grid ({dataset.montage}, {dataset.noise_mode} covariance, "
-        f"temporal {_format_powerlaw_label(noise_powerlaw_beta)}, "
-        f"source_freq={dataset.metadata[0]['source_freq_hz']:g} Hz)"
-    )
-    fig.suptitle(title, fontsize=12)
-    output_path = Path(output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=180)
-    if show:
-        plt.show()
-    else:
-        plt.close(fig)
+                    if row_idx == 0:
+                        ax.set_title(
+                            f"source_freq={float(source_frequency_hz):g} Hz",
+                            fontsize=9,
+                        )
+                    if col_idx == 0:
+                        ax.set_ylabel(
+                            f"noise_std x{float(noise_std_multiplier):g}\n"
+                            f"phase={_format_phase_pi(phase_pi)}",
+                            fontsize=7,
+                        )
+                    if row_idx == n_rows - 1:
+                        ax.set_xlabel("Time (s)")
+
+        title = (
+            f"Waveform grid: amplitude={float(amplitude_nam):g} nAm\n"
+            f"{dataset.montage}, {dataset.noise_mode}, "
+            f"{_format_powerlaw_label(noise_powerlaw_beta)}"
+        )
+        fig.suptitle(title, fontsize=11)
+        output_path = _grid_output_path(output, amplitudes_nam, amplitude_nam)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path, dpi=180)
+        written_paths.append(output_path)
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
+    dataset.generated_plot_paths = [str(path) for path in written_paths]
 
 
 def plot_waveform_parameter_grid(
@@ -809,21 +868,15 @@ def plot_waveform_parameter_grid(
     subjects_dir: Optional[str] = None,
     fetch_fsaverage: bool = True,
     random_state: int = 0,
-    n_repeats: int = 4,
+    n_repeats: int = 1,
     n_plot_channels: int = 8,
     noise_mode: str = "spatial_distance",
     noise_iir_filter: Optional[Sequence[float]] = (0.2, -0.2, 0.04),
     spatial_noise_length_scale_cm: float = 6.0,
-    grid_source_freq_hz: float = 10.0,
-    grid_amplitudes_nam: Sequence[float] = (
-        0.01,
-        0.05,
-        0.1,
-        0.15,
-        0.2,
-        0.5,
-    ),
-    grid_noise_std_multipliers: Sequence[float] = (1.0, 2.0, 5.0, 10.0, 15.0),
+    grid_source_frequencies_hz: Sequence[float] = (5.0, 10.0, 18.0),
+    grid_amplitudes_nam: Sequence[float] = (0.001, 0.01, 0.1),
+    grid_phases_pi: Sequence[float] = (0.0, 0.5, 1.0),
+    grid_noise_std_multipliers: Sequence[float] = (1.0, 5.0, 15.0),
     noise_powerlaw_beta: float = 1.0,
     show: bool = False,
 ) -> SyntheticSourceDataset:
@@ -834,10 +887,11 @@ def plot_waveform_parameter_grid(
             "or noise_mode='spatial_distance'"
         )
 
-    trial_parameters = _build_amplitude_noise_grid_trials(
+    trial_parameters = _build_multifactor_grid_trials(
         amplitudes_nam=grid_amplitudes_nam,
+        source_frequencies_hz=grid_source_frequencies_hz,
+        phases_pi=grid_phases_pi,
         noise_std_multipliers=grid_noise_std_multipliers,
-        source_freq_hz=grid_source_freq_hz,
         n_repeats=n_repeats,
     )
     dataset = SyntheticSourceDataset(
@@ -861,6 +915,8 @@ def plot_waveform_parameter_grid(
         dataset=dataset,
         output=output,
         amplitudes_nam=grid_amplitudes_nam,
+        source_frequencies_hz=grid_source_frequencies_hz,
+        phases_pi=grid_phases_pi,
         noise_std_multipliers=grid_noise_std_multipliers,
         noise_mode=normalized_noise_mode,
         noise_powerlaw_beta=noise_powerlaw_beta,
@@ -894,16 +950,10 @@ def plot_sample_outputs(
     noise_powerlaw_beta: float = 1.0,
     psd_fmin: float = 1.0,
     psd_fmax: float = 80.0,
-    grid_source_freq_hz: float = 10.0,
-    grid_amplitudes_nam: Sequence[float] = (
-        0.01,
-        0.05,
-        0.1,
-        0.15,
-        0.2,
-        0.5,
-    ),
-    grid_noise_std_multipliers: Sequence[float] = (1.0, 2.0, 5.0, 10.0, 15.0),
+    grid_source_frequencies_hz: Sequence[float] = (5.0, 10.0, 18.0),
+    grid_amplitudes_nam: Sequence[float] = (0.001, 0.01, 0.1),
+    grid_phases_pi: Sequence[float] = (0.0, 0.5, 1.0),
+    grid_noise_std_multipliers: Sequence[float] = (1.0, 5.0, 15.0),
     grid_noise_powerlaw_beta: float = 1.0,
     save_dataset: bool = False,
     show: bool = False,
@@ -938,8 +988,9 @@ def plot_sample_outputs(
             noise_mode=noise_mode,
             noise_iir_filter=noise_iir_filter,
             spatial_noise_length_scale_cm=spatial_noise_length_scale_cm,
-            grid_source_freq_hz=grid_source_freq_hz,
+            grid_source_frequencies_hz=grid_source_frequencies_hz,
             grid_amplitudes_nam=grid_amplitudes_nam,
+            grid_phases_pi=grid_phases_pi,
             grid_noise_std_multipliers=grid_noise_std_multipliers,
             noise_powerlaw_beta=grid_noise_powerlaw_beta,
             show=show,
@@ -961,8 +1012,9 @@ def plot_sample_outputs(
             noise_mode=noise_mode,
             noise_iir_filter=noise_iir_filter,
             spatial_noise_length_scale_cm=spatial_noise_length_scale_cm,
-            grid_source_freq_hz=grid_source_freq_hz,
+            grid_source_frequencies_hz=grid_source_frequencies_hz,
             grid_amplitudes_nam=grid_amplitudes_nam,
+            grid_phases_pi=grid_phases_pi,
             grid_noise_std_multipliers=grid_noise_std_multipliers,
             noise_powerlaw_beta=grid_noise_powerlaw_beta,
             psd_fmin=psd_fmin,
@@ -1020,8 +1072,9 @@ def plot_sample_outputs(
             noise_mode=noise_mode,
             noise_iir_filter=noise_iir_filter,
             spatial_noise_length_scale_cm=spatial_noise_length_scale_cm,
-            grid_source_freq_hz=grid_source_freq_hz,
+            grid_source_frequencies_hz=grid_source_frequencies_hz,
             grid_amplitudes_nam=grid_amplitudes_nam,
+            grid_phases_pi=grid_phases_pi,
             grid_noise_std_multipliers=grid_noise_std_multipliers,
             noise_powerlaw_beta=grid_noise_powerlaw_beta,
             show=show,
@@ -1041,8 +1094,9 @@ def plot_sample_outputs(
             noise_mode=noise_mode,
             noise_iir_filter=noise_iir_filter,
             spatial_noise_length_scale_cm=spatial_noise_length_scale_cm,
-            grid_source_freq_hz=grid_source_freq_hz,
+            grid_source_frequencies_hz=grid_source_frequencies_hz,
             grid_amplitudes_nam=grid_amplitudes_nam,
+            grid_phases_pi=grid_phases_pi,
             grid_noise_std_multipliers=grid_noise_std_multipliers,
             noise_powerlaw_beta=grid_noise_powerlaw_beta,
             psd_fmin=psd_fmin,
@@ -1091,7 +1145,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--subjects-dir", default=None)
     parser.add_argument("--no-fetch-fsaverage", action="store_true")
     parser.add_argument("--random-state", type=int, default=0)
-    parser.add_argument("--n-repeats", type=int, default=3)
+    parser.add_argument("--n-repeats", type=int, default=1)
     parser.add_argument("--n-plot-channels", type=int, default=8)
     parser.add_argument(
         "--noise-mode",
@@ -1108,13 +1162,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--noise-powerlaw-beta", type=float, default=1.0)
     parser.add_argument("--psd-fmin", type=float, default=1.0)
     parser.add_argument("--psd-fmax", type=float, default=80.0)
-    parser.add_argument("--grid-source-freq-hz", type=float, default=10.0)
-    parser.add_argument("--grid-amplitudes-nam", default="0.01,0.05,0.1,0.15,0.2,0.5")
+    parser.add_argument(
+        "--grid-source-frequencies-hz",
+        "--grid-source-freq-hz",
+        dest="grid_source_frequencies_hz",
+        default="5,10,18",
+    )
+    parser.add_argument("--grid-amplitudes-nam", default="0.001,0.01,0.1")
+    parser.add_argument("--grid-phases-pi", default="0,0.5,1")
     parser.add_argument(
         "--grid-noise-std-multipliers",
         "--grid-noise-std-multiplier",
         dest="grid_noise_std_multipliers",
-        default="1,2,5,10,15",
+        default="1,5,15",
     )
     parser.add_argument("--grid-powerlaw-beta", type=float, default=1.0)
     parser.add_argument(
@@ -1160,8 +1220,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             noise_powerlaw_beta=args.noise_powerlaw_beta,
             psd_fmin=args.psd_fmin,
             psd_fmax=args.psd_fmax,
-            grid_source_freq_hz=args.grid_source_freq_hz,
+            grid_source_frequencies_hz=_parse_float_list(
+                args.grid_source_frequencies_hz
+            ),
             grid_amplitudes_nam=_parse_float_list(args.grid_amplitudes_nam),
+            grid_phases_pi=_parse_float_list(args.grid_phases_pi),
             grid_noise_std_multipliers=_parse_float_list(
                 args.grid_noise_std_multipliers
             ),
@@ -1172,14 +1235,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except (FileNotFoundError, ModuleNotFoundError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
-    if args.plot_kind in {"waveform", "both", "all"}:
-        print(f"Wrote {args.output}")
-    if args.plot_kind in {"waveform_grid", "all"}:
-        print(f"Wrote {args.waveform_grid_output}")
-    if args.plot_kind in {"psd", "both", "all"}:
-        print(f"Wrote {args.psd_output}")
-    if args.plot_kind in {"psd_grid", "all"}:
-        print(f"Wrote {args.psd_grid_output}")
+    generated_plot_paths = getattr(dataset, "generated_plot_paths", None)
+    if generated_plot_paths:
+        for output_path in generated_plot_paths:
+            print(f"Wrote {output_path}")
+    else:
+        if args.plot_kind in {"waveform", "both", "all"}:
+            print(f"Wrote {args.output}")
+        if args.plot_kind in {"waveform_grid", "all"}:
+            print(f"Wrote {args.waveform_grid_output}")
+        if args.plot_kind in {"psd", "both", "all"}:
+            print(f"Wrote {args.psd_output}")
+        if args.plot_kind in {"psd_grid", "all"}:
+            print(f"Wrote {args.psd_grid_output}")
     print(f"Generated panel data: X.shape={dataset.X.shape}")
     return 0
 
