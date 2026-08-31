@@ -1,0 +1,66 @@
+# Minimal channel-independent EEG adaptation of DAC.
+# Each EEG electrode is treated as a separate mono training example.
+
+data:
+  # The toy default uses the minimally referenced Alice recording.
+  files:
+    - /data/groups/bci/jonas/workspace/alice_build/smoke_cache/prep/*_cleaned_noref_raw.fif
+  sample_rate: 256
+  window_seconds: 10.0
+  train_fraction: 0.8
+  examples_per_epoch: 4096
+  val_examples: 256
+  # Robust per-recording, per-channel normalization followed by tanh-safe scaling.
+  clip_mad: 8.0
+
+model:
+  encoder_dim: 64
+  encoder_rates: [2, 2, 2, 4]
+  decoder_dim: 512
+  decoder_rates: [4, 2, 2, 2]
+  n_codebooks: 8
+  codebook_size: 1024
+  codebook_dim: 8
+  quantizer_dropout: 1.0
+
+loss:
+  waveform: 1.0
+  stft: 1.0
+  commitment: 0.25
+  codebook: 1.0
+  stft_windows: [64, 128, 256]
+
+augmentations:
+  enabled: true
+  slow_drift:
+    probability: 0.5
+    frequency_hz: [0.05, 0.5]
+    amplitude: [0.0, 0.15]
+  baseline_shift:
+    probability: 0.5
+    offset: [-0.15, 0.15]
+  phase_shift:
+    probability: 0.5
+    max_radians: 0.785398
+  line_noise:
+    probability: 0.5
+    frequencies_hz: [50.0, 60.0]
+    amplitude: [0.0, 0.08]
+  clip: 1.0
+
+training:
+  seed: 0
+  device: auto
+  batch_size: 12
+  num_workers: 0
+  epochs: 30
+  learning_rate: 0.0001
+  betas: [0.8, 0.99]
+  grad_clip: 1000.0
+  amp: true
+  output_dir: runs/eeg_alice
+
+visualize:
+  noise_std: [0.05, 0.10, 0.20, 0.40]
+  channel_index: 0
+  output_file: eeg_dac_diagnostics.png

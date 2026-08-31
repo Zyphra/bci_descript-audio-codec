@@ -1,0 +1,72 @@
+# Full Alice experiment: all available subjects, one minimally referenced
+# representation per subject, with lazy FIF window reads.
+
+data:
+  files:
+    - /data/groups/bci/jonas/workspace/alice/Alice/cache/prep/*_cleaned_noref_raw.fif
+  sample_rate: 256
+  window_seconds: 10.0
+  train_fraction: 0.8
+  examples_per_epoch: 8192
+  val_examples: 1024
+  normalization_seconds: 30.0
+  normalization_chunks: 3
+  clip_mad: 8.0
+
+model:
+  encoder_dim: 64
+  encoder_rates: [2, 2, 2, 4]
+  decoder_dim: 512
+  decoder_rates: [4, 2, 2, 2]
+  n_codebooks: 8
+  codebook_size: 1024
+  codebook_dim: 8
+  # Train every RVQ level on every example. Re-enable dropout only after all
+  # levels demonstrate healthy utilization.
+  quantizer_dropout: 0.0
+
+loss:
+  waveform: 1.0
+  stft: 1.0
+  commitment: 0.25
+  codebook: 1.0
+  stft_windows: [64, 128, 256]
+
+augmentations:
+  enabled: true
+  slow_drift:
+    probability: 0.5
+    frequency_hz: [0.05, 0.5]
+    amplitude: [0.0, 0.15]
+  baseline_shift:
+    probability: 0.5
+    offset: [-0.15, 0.15]
+  phase_shift:
+    probability: 0.5
+    max_radians: 0.785398
+  line_noise:
+    probability: 0.5
+    frequencies_hz: [50.0, 60.0]
+    amplitude: [0.0, 0.08]
+  clip: 1.0
+
+training:
+  seed: 0
+  device: auto
+  batch_size: 12
+  # MNE Raw handles remain in the main process for reliable lazy random reads.
+  num_workers: 0
+  epochs: 30
+  learning_rate: 0.0001
+  betas: [0.8, 0.99]
+  grad_clip: 1000.0
+  amp: true
+  output_dir: runs/eeg_alice_all
+
+visualize:
+  noise_std: [0.05, 0.10, 0.20, 0.40]
+  channel_index: 0
+  output_file: eeg_dac_diagnostics.png
+
+evaluation:
+  code_examples: 1024

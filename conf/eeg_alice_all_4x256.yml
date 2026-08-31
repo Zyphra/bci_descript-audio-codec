@@ -1,0 +1,10 @@
+extends: eeg_alice_all.yml
+
+model:
+  n_codebooks: 4
+  codebook_size: 256
+  codebook_dim: 8
+  quantizer_dropout: 0.0
+
+training:
+  output_dir: runs/eeg_alice_all_4x256
