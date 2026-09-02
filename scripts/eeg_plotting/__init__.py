@@ -1,0 +1,2 @@
+"""Training-integrated EEG visualizations."""
+

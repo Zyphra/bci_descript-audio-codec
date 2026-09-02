@@ -1,3 +1,103 @@
+# EEG adaptation of Descript Audio Codec
+
+This fork trains the DAC encoder, residual vector quantizer, and decoder as an
+EEG tokenizer. The original `dac/` package and audio training path remain
+unchanged. EEG-specific data handling, objectives, augmentations, diagnostics,
+and training live in separate files.
+
+## Current files
+
+| File | Status | Purpose |
+|---|---|---|
+| `dac/` | Original, untouched | DAC encoder, decoder, and residual vector quantizer |
+| `scripts/train.py` | Original, untouched | Descript's audio GAN trainer |
+| `conf/base.yml` | Original, untouched | Descript's audio training configuration |
+| `scripts/train_eeg.py` | EEG addition | Current annotated EEG training program |
+| `conf/base_eeg.yml` | EEG addition | Current EEG configuration in DAC's argbind format |
+| `scripts/eeg_plotting/training_plots.py` | EEG addition | Integrated augmentation, reconstruction, PSD, and codebook plots |
+| `scripts/eeg_dac_models.py` | Optional experiment | Alternative EEG decoders; not used by the current trainer |
+| `conf/old/` and `runs/old/` | Archive | Earlier configurations, results, figures, and checkpoints |
+
+The EEG trainer marks its sections as **KEPT**, **CHANGED**, **COMMENTED OUT**,
+or **ADDED FOR EEG**. Displaced audio operations remain as comments beside their
+EEG replacements; the executable original remains in `scripts/train.py`.
+
+## Execution paths
+
+Original audio DAC:
+
+```text
+conf/base.yml + conf/1gpu.yml
+    -> argbind
+    -> scripts/train.py
+    -> AudioDataset + audio transforms
+    -> DAC generator + discriminator
+    -> waveform + STFT + mel + adversarial + VQ losses
+```
+
+Current EEG tokenizer:
+
+```text
+conf/base_eeg.yml
+    -> argbind
+    -> scripts/train_eeg.py
+    -> lazy MNE FIF windows + robust per-electrode normalization
+    -> noisy student and detached clean teacher
+    -> original DAC encoder + RVQ + decoder
+    -> waveform + log-power STFT + VQ + diversity + consistency losses
+```
+
+Each EEG channel is currently sampled and encoded independently as a mono
+signal. At 256 Hz with encoder strides `[2, 2, 2, 4]`, the model emits 8 latent
+frames per second, or one frame every 125 ms. Each frame contains two residual
+code IDs, each selected from a 128-entry codebook.
+
+## What is retained, removed, and added
+
+Retained from DAC:
+
+- convolutional encoder and decoder, Snake activations, and residual units;
+- residual vector quantization, codebook loss, and commitment loss;
+- AdamW, the learning-rate scheduler, AMP, gradient clipping, and checkpoint
+  state.
+
+Not used by the current EEG trainer:
+
+- the audio discriminator and adversarial/feature-matching objectives;
+- mel-spectrogram loss and audio-specific transforms;
+- the multi-GPU accelerator/tracker wrapper and playable-audio sample export.
+
+Added for EEG:
+
+- lazy `.fif` loading through MNE and robust median/MAD normalization;
+- slow drift, baseline shift, phase shift, line noise, Gaussian noise, and
+  signal-mixing augmentations;
+- detached clean-teacher versus noisy-student latent consistency;
+- linear-frequency log-power STFT reconstruction and assignment diversity;
+- clean/noisy hard-token agreement and codebook-collapse diagnostics;
+- W&B step-level losses, epoch summaries, fixed reconstruction galleries, PSD
+  galleries, and codebook-usage heatmaps.
+
+The exact settings and loss weights in `conf/base_eeg.yml` are the source of
+truth for each run.
+
+## Run the EEG trainer
+
+```bash
+source /data/groups/bci/jonas/venv_dac/bin/activate
+cd /data/groups/bci/jonas/workspace/bci_descript-audio-codec
+
+CUDA_VISIBLE_DEVICES=3 python scripts/train_eeg.py \
+  --args.load conf/base_eeg.yml
+```
+
+Each run saves `latest.pt`, the lowest-validation-loss `best.pt`, an epoch-level
+`history.json`, and a `plots/` directory. Earlier outputs remain in `runs/old/`.
+
+---
+
+The remainder of this README is the original Descript Audio Codec documentation.
+
 # Descript Audio Codec (.dac): High-Fidelity Audio Compression with Improved RVQGAN
 
 This repository contains training and inference scripts

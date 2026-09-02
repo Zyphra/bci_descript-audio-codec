@@ -1,0 +1,237 @@
+# =============================================================================
+# Model setup
+# =============================================================================
+
+# ORIGINAL AUDIO DAC:
+# DAC.sample_rate: 44100
+# DAC.encoder_dim: 64
+# DAC.encoder_rates: [2, 4, 8, 8]
+# DAC.decoder_dim: 1536
+# DAC.decoder_rates: [8, 8, 4, 2]
+
+# EEG REPLACEMENT:
+DAC.sample_rate: 256
+DAC.encoder_dim: 64 #each time point is assigned 64 features (?), DAC doubles this each encoder stage. 
+DAC.encoder_rates: [2, 2, 2, 4]
+DAC.decoder_dim: 512
+DAC.decoder_rates: [4, 2, 2, 2]
+# encoder rates are: 2*2*2*4 = 32, output rate: 256/32 = 8 latent frames per second --> 0.125s
+# continuous latent has shape [batch, 1024, 80]
+
+
+# =============================================================================
+# Quantization
+# =============================================================================
+
+# ORIGINAL AUDIO DAC:
+# DAC.n_codebooks: 9
+# DAC.codebook_size: 1024
+# DAC.codebook_dim: 8
+# DAC.quantizer_dropout: 1.0
+
+# EEG REPLACEMENT:
+DAC.n_codebooks: 2 #each codebook represents remaining error, i.e., frame 1 → [code 37, code 91] 
+DAC.codebook_size: 128 #possible entries in each codebook
+DAC.codebook_dim: 8 #internal geometry of codebook 
+DAC.quantizer_dropout: 0.0 #set to 0 as we only have 2 coebooks, only makes sense if we have more codebooks
+
+# =============================================================================
+# Discriminator, audio specific and removed here
+# =============================================================================
+
+# ORIGINAL AUDIO DAC — COMMENTED OUT; current EEG training has no discriminator:
+# Discriminator.sample_rate: 44100
+# Discriminator.rates: []
+# Discriminator.periods: [2, 3, 5, 7, 11]
+# Discriminator.fft_sizes: [2048, 1024, 512]
+# Discriminator.bands:
+#   - [0.0, 0.1]
+#   - [0.1, 0.25]
+#   - [0.25, 0.5]
+#   - [0.5, 0.75]
+#   - [0.75, 1.0]
+
+# =============================================================================
+# Optimization
+# =============================================================================
+
+# ORIGINAL AUDIO DAC:
+# AdamW.betas: [0.8, 0.99]
+# AdamW.lr: 0.0001
+# ExponentialLR.gamma: 0.999996
+# amp: false
+# val_batch_size: 100
+# device: cuda
+# num_iters: 250000
+# save_iters: [10000, 50000, 100000, 200000]
+# valid_freq: 1000
+# sample_freq: 10000
+# num_workers: 32
+# seed: 0
+
+# EEG REPLACEMENT:
+AdamW.betas: [0.8, 0.99]
+AdamW.lr: 3.0e-05 #conservative for now, we probably want to increase this later
+ExponentialLR.gamma: 1.0
+amp: true #automatic mixed precision 
+batch_size: 12
+val_batch_size: 12
+num_iters: 20490       # 30 epochs x ceil(8192 / 12) batches
+valid_freq: 683        # validate once per epoch
+# sample_freq: 10000   # ORIGINAL DAC audio sample export; replaced by EEGPlots.every_epochs
+num_workers: 0
+seed: 0
+grad_clip: 10.0 # generator grad, original 1000, After backpropagation, the combined gradient norm is limited to 10
+# discriminator grad norm clipped at 10 
+resume: false #added for debug
+save_path: runs/eeg_alice_all_teacher_student_dac_style
+
+# =============================================================================
+# Experiment tracking — ADDED FOR EEG; disabled until wandb is installed/logged in
+# =============================================================================
+
+WandB.enabled: true
+WandB.project: eeg-dac
+WandB.entity: ""
+WandB.name: eeg-alice-125ms-teacher-student
+WandB.group: alice
+WandB.tags: [eeg, dac, teacher-student, 125ms]
+WandB.mode: online
+WandB.log_freq: 1  # training scalars are logged after every optimizer step
+WandB.log_reconstruction: true
+WandB.watch_model: false
+
+# =============================================================================
+# Training-integrated plots — ADDED FOR EEG
+# =============================================================================
+
+EEGPlots.enabled: true
+EEGPlots.every_epochs: 2       # waveform, matching PSD, and codebook heatmap
+EEGPlots.n_examples: 16         # fixed 4 x 4 validation gallery
+EEGPlots.augmentation_examples: 5
+EEGPlots.seconds: 5.0
+EEGPlots.seed: 7
+EEGPlots.psd_fmin: 1.0
+EEGPlots.psd_fmax: 45.0
+EEGPlots.psd_window_seconds: 1.0
+
+# =============================================================================
+# Loss weights
+# =============================================================================
+
+# ORIGINAL AUDIO DAC:
+# lambdas:
+#   mel/loss: 15.0
+#   adv/feat_loss: 2.0
+#   adv/gen_loss: 1.0
+#   vq/commitment_loss: 0.25
+#   vq/codebook_loss: 1.0
+
+# EEG REPLACEMENT:
+lambdas:
+  waveform/loss: 10.0 #we may want to reduce this and increase the latent consistency loss
+  stft/loss: 1.0
+  vq/commitment_loss: 0.25
+  vq/codebook_loss: 1.0
+  eeg/diversity_loss: 0.1 #encourages diversity in the generated codebooks
+  eeg/latent_consistency_loss: 1.0
+
+# =============================================================================
+# Transforms / augmentations
+# =============================================================================
+
+# ORIGINAL AUDIO DAC:
+# VolumeNorm.db: [const, -16]
+# build_transform.preprocess:
+#   - Identity
+# build_transform.augment_prob: 0.0
+# build_transform.augment:
+#   - Identity
+# build_transform.postprocess:
+#   - VolumeNorm
+#   - RescaleAudio
+#   - ShiftPhase
+
+# EEG REPLACEMENT:
+EEGAugment.enabled: true
+EEGAugment.slow_drift_probability: 0.5
+EEGAugment.slow_drift_frequency_hz: [0.05, 0.5]
+EEGAugment.slow_drift_amplitude: [0.0, 0.15]
+EEGAugment.baseline_shift_probability: 0.5
+EEGAugment.baseline_shift_offset: [-0.15, 0.15]
+EEGAugment.phase_shift_probability: 0.5
+EEGAugment.phase_shift_max_radians: 0.785398
+EEGAugment.line_noise_probability: 0.5
+EEGAugment.line_noise_frequencies_hz: [50.0, 60.0]
+EEGAugment.line_noise_amplitude: [0.0, 0.08]
+EEGAugment.gaussian_noise_probability: 0.5
+EEGAugment.gaussian_noise_std: [0.0, 0.1]
+EEGAugment.signal_mix_probability: 0.5
+EEGAugment.signal_mix_fraction: [0.0, 0.1]
+EEGAugment.clip: 1.0
+
+# =============================================================================
+# Loss setup
+# we remvoed all the MEL stuff as it's specific audio
+# =============================================================================
+
+# ORIGINAL AUDIO DAC:
+# MultiScaleSTFTLoss.window_lengths: [2048, 512]
+# MelSpectrogramLoss.n_mels: [5, 10, 20, 40, 80, 160, 320]
+# MelSpectrogramLoss.window_lengths: [32, 64, 128, 256, 512, 1024, 2048]
+# MelSpectrogramLoss.mel_fmin: [0, 0, 0, 0, 0, 0, 0]
+# MelSpectrogramLoss.mel_fmax: [null, null, null, null, null, null, null]
+# MelSpectrogramLoss.pow: 1.0
+# MelSpectrogramLoss.clamp_eps: 1.0e-5
+# MelSpectrogramLoss.mag_weight: 0.0
+
+# EEG REPLACEMENT:
+EEGLoss.stft_windows: [64, 128, 256]  # 250 ms, 500 ms, and 1 second
+EEGLoss.stft_mode: log_power
+
+# =============================================================================
+# Data
+# =============================================================================
+
+# ORIGINAL AUDIO DAC:
+# batch_size: 72
+# train/AudioDataset.duration: 0.38
+# train/AudioDataset.n_examples: 10000000
+# val/AudioDataset.duration: 5.0
+# val/AudioDataset.n_examples: 250
+# test/AudioDataset.duration: 10.0
+# test/AudioDataset.n_examples: 1000
+# AudioLoader.shuffle: true
+# AudioDataset.without_replacement: true
+# train/build_dataset.folders:
+#   speech_fb:
+#     - /data/daps/train
+#   speech_hq:
+#     - /data/vctk
+#   music_hq:
+#     - /data/musdb/train
+#   general:
+#     - /data/audioset/data/unbalanced_train_segments/
+
+# EEG REPLACEMENT — same recordings, different temporal split per scope:
+train/build_dataset.files:
+  - /data/groups/bci/jonas/workspace/alice/Alice/cache/prep/*_cleaned_noref_raw.fif
+train/build_dataset.window_seconds: 10.0
+train/build_dataset.n_examples: 8192
+train/build_dataset.split: train
+train/build_dataset.train_fraction: 0.8
+train/build_dataset.clip_mad: 8.0
+train/build_dataset.normalization_seconds: 30.0
+train/build_dataset.normalization_chunks: 3
+train/build_dataset.seed: 0
+
+val/build_dataset.files:
+  - /data/groups/bci/jonas/workspace/alice/Alice/cache/prep/*_cleaned_noref_raw.fif
+val/build_dataset.window_seconds: 10.0
+val/build_dataset.n_examples: 1024
+val/build_dataset.split: val
+val/build_dataset.train_fraction: 0.8
+val/build_dataset.clip_mad: 8.0
+val/build_dataset.normalization_seconds: 30.0
+val/build_dataset.normalization_chunks: 3
+val/build_dataset.seed: 0
