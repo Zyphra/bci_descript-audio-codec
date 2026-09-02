@@ -83,8 +83,19 @@ truth for each run.
 
 ## Run the EEG trainer
 
+Create a Python 3.10 environment with the pinned EEG dependencies. The optional
+argument chooses where the environment is stored:
+
 ```bash
-source /data/groups/bci/jonas/venv_dac/bin/activate
+bash scripts/create_eeg_venv.sh ~/venv_dac
+```
+
+This installs the current checkout in editable mode; do not run `pip install
+dac`, which installs an unrelated PyPI package. Each colleague should then log
+in to W&B once with `wandb login` if online experiment tracking is enabled.
+
+```bash
+source ~/venv_dac/bin/activate
 cd /data/groups/bci/jonas/workspace/bci_descript-audio-codec
 
 CUDA_VISIBLE_DEVICES=3 python scripts/train_eeg.py \
