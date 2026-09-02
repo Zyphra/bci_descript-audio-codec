@@ -215,7 +215,7 @@ EEGLoss.stft_mode: log_power
 
 # EEG REPLACEMENT — same recordings, different temporal split per scope:
 train/build_dataset.files:
-  - /data/groups/bci/jonas/workspace/alice/Alice/cache/prep/*_cleaned_noref_raw.fif
+  - /data/groups/bci/datasets/alice/Alice/cache/prep/*_cleaned_noref_raw.fif
 train/build_dataset.window_seconds: 10.0
 train/build_dataset.n_examples: 8192
 train/build_dataset.split: train
@@ -226,7 +226,7 @@ train/build_dataset.normalization_chunks: 3
 train/build_dataset.seed: 0
 
 val/build_dataset.files:
-  - /data/groups/bci/jonas/workspace/alice/Alice/cache/prep/*_cleaned_noref_raw.fif
+  - /data/groups/bci/datasets/alice/Alice/cache/prep/*_cleaned_noref_raw.fif
 val/build_dataset.window_seconds: 10.0
 val/build_dataset.n_examples: 1024
 val/build_dataset.split: val
