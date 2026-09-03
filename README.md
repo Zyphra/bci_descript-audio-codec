@@ -103,7 +103,10 @@ CUDA_VISIBLE_DEVICES=3 python scripts/train_eeg.py \
 ```
 
 Each run saves `latest.pt`, the lowest-validation-loss `best.pt`, an epoch-level
-`history.json`, and a `plots/` directory. Earlier outputs remain in `runs/old/`.
+`history.json`, and a `plots/` directory. It also saves `config_input.yml` (the
+exact supplied file) and `config_resolved.yml` (defaults plus command-line
+overrides actually used). The resolved configuration is also stored in W&B and
+inside each checkpoint. Earlier outputs remain in `runs/old/`.
 
 ---
 

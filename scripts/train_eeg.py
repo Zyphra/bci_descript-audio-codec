@@ -16,6 +16,7 @@ import glob
 import json
 import math
 import random
+import shutil
 import tempfile
 import time
 from typing import Dict, Iterable, List, Sequence, Tuple
@@ -183,6 +184,17 @@ def initialize_wandb(config: dict, args, output: Path, model: torch.nn.Module):
     if config["watch_model"]:
         wandb.watch(model, log="gradients", log_freq=config["log_freq"])
     return wandb, run
+
+
+def save_run_configuration(args, output: Path) -> None:
+    """Save both the authored input and fully resolved run configuration."""
+    resolved = dict(args)
+    argbind.dump_args(resolved, output / "config_resolved.yml")
+    source_name = resolved.get("args.load")
+    if source_name:
+        source = Path(source_name).expanduser().resolve()
+        if source.is_file():
+            shutil.copy2(source, output / "config_input.yml")
 
 
 def get_infinite_loader(dataloader):
@@ -788,6 +800,7 @@ def train(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     output = Path(save_path)
     output.mkdir(parents=True, exist_ok=True)
+    save_run_configuration(args, output)
     state = load(args, device, resume=resume, save_path=save_path)
     wandb_config = WandB()
     plot_config = EEGPlots()
