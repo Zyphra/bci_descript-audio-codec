@@ -1,3 +1,65 @@
+# Notes
+
+  Original DAC’s training objective uses:
+  - (MAIN loss) Mel-spectrogram reconstruction
+  - (MAIN loss) Adversarial generator loss
+  - Discriminator feature-matching loss
+  - VQ commitment loss
+  - VQ codebook loss
+  + It also trains a separate audio discriminator.
+
+  Our EEG objective uses:
+  - Waveform L1 reconstruction
+  - Linear-frequency log-power STFT reconstruction
+  - VQ commitment loss
+  - VQ codebook loss
+  - Code-assignment diversity loss
+  - Optional teacher–student latent-consistency loss
+
+  We do not use:
+  - Mel-spectrogram loss
+  - Audio discriminator
+  - Adversarial loss
+  - Discriminator feature-matching loss
+
+Other main changes: 
+- teacher student model (part of los above)
+  - we added a clean forward pass
+  - cosine consistency between clean and noisy pass
+  - NOTE: setting consistency weight to 0 skips this pass effectively 
+- EEG augmentations
+  - Amplitude scaling
+  - Slow baseline drift
+  - Constant baseline shifts
+  - Phase shifts
+  - 50/60 Hz line noise
+  - Gaussian noise
+  - A small mixture of another EEG example
+  - Final clipping
+- assignment diversity loss (codebook collapsed otherwise, original DAC didn't need this)
+- We replaced audio mel reconstruction with:
+  - EEGLoss.stft_windows: [64, 128, 256]
+  - EEGLoss.stft_mode: log_power
+  --> linear-frequency STFT loss (instead of MEL spectogram)
+
+Other stuff
+  - Temporal 80/20 training-validation split
+  - MNE .fif loading
+  - Median/MAD normalization per electrode and recording
+  - EEG arrays rather than playable audio examples
+  - W&B logging
+  - Step-level and epoch-level loss curves
+  - Waveform reconstruction galleries
+  - PSD reconstruction galleries
+  - Codebook-usage heatmaps
+  - Perplexity and dominant-code diagnostics
+  - Clean/noisy token agreement
+  - best.pt, best_waveform.pt, best_stft.pt, and latest.pt
+  - Saving the resolved YAML, source snapshot, and Git commit with each run
+
+
+
+
 # EEG adaptation of Descript Audio Codec
 
 This fork trains the DAC encoder, residual vector quantizer, and decoder as an

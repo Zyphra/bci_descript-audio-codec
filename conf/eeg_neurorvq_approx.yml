@@ -1,0 +1,121 @@
+# NeuroRVQ-inspired configuration expressed through the EEG-DAC trainer.
+# This is NOT NeuroRVQ itself. It maps the paper's quantization scale into DAC:
+#   paper: 200 Hz, 1-s patches, four branches x eight RVQ stages, K=8192, D=128,
+#          commitment beta=1, EMA=0.99, K-means initialization.
+#   here:  256 Hz Alice data, 1-s DAC frames, one stream x 32 RVQ stages,
+#          K=8192, D=128, gradient-updated DAC codebooks.
+# DAC cannot reproduce the paper's Transformer/electrode embeddings, four distinct
+# signal/FFT branches, EMA, K-means initialization, or circular phase loss.
+
+# Hop 256 at 256 Hz gives the closest temporal analogue to 1-s paper patches.
+DAC.sample_rate: 256
+DAC.encoder_dim: 64
+DAC.encoder_rates: [4, 4, 4, 4]
+DAC.decoder_dim: 512
+DAC.decoder_rates: [4, 4, 4, 4]
+
+# Collapse four paper branches into one DAC RVQ stack: 4 x 8 = 32 indices/frame.
+DAC.n_codebooks: 32
+DAC.codebook_size: 8192
+DAC.codebook_dim: 128
+DAC.quantizer_dropout: 0.0
+
+# Paper-reported optimizer values where this trainer supports them.
+# Cosine scheduling and ten warm-up epochs are not implemented in train_eeg.py;
+# gamma=1 therefore holds the learning rate constant.
+AdamW.betas: [0.9, 0.999]
+AdamW.lr: 5.0e-05
+AdamW.weight_decay: 1.0e-04
+ExponentialLR.gamma: 1.0
+amp: false
+# NeuroRVQ used batch 256. Batch 12 keeps this much larger DAC analogue runnable.
+batch_size: 12
+val_batch_size: 12
+num_iters: 68300       # 100 epochs, matching the paper's reported duration
+valid_freq: 683
+num_workers: 0
+seed: 0
+grad_clip: 3.0
+resume: false
+save_path: runs/eeg_neurorvq_dac_approx
+
+WandB.enabled: true
+WandB.project: eeg-dac
+WandB.entity: ""
+WandB.name: eeg-neurorvq-dac-approx
+WandB.group: model-comparison
+WandB.tags: [eeg, dac, neurorvq-approx, 1s, 32x8192]
+WandB.mode: online
+WandB.log_freq: 1
+WandB.log_reconstruction: true
+WandB.watch_model: false
+
+EEGPlots.enabled: true
+EEGPlots.every_epochs: 10
+EEGPlots.n_examples: 16
+EEGPlots.augmentation_examples: 5
+EEGPlots.seconds: 5.0
+EEGPlots.seed: 7
+EEGPlots.psd_fmin: 1.0
+EEGPlots.psd_fmax: 45.0
+EEGPlots.psd_window_seconds: 1.0
+
+# Closest available objectives. NeuroRVQ reconstructs temporal, FFT amplitude,
+# and circular phase targets; DAC provides waveform L1 and log-power STFT only.
+# Codebook loss is required because DAC uses gradients rather than paper EMA.
+# Diversity=0.1 substitutes for the unavailable EMA/K-means anti-collapse path.
+lambdas:
+  waveform/loss: 10.0
+  stft/loss: 1.0
+  vq/commitment_loss: 1.0
+  vq/codebook_loss: 1.0
+  eeg/diversity_loss: 0.1
+  eeg/latent_consistency_loss: 0.0
+
+# NeuroRVQ does not use our explicit noisy-student/clean-teacher objective.
+EEGAugment.enabled: false
+
+# Keep a common evaluation corruption distribution for comparison with our winner.
+EEGEvalAugment.enabled: true
+EEGEvalAugment.amplitude_scale_probability: 0.5
+EEGEvalAugment.amplitude_scale: [0.5, 1.5]
+EEGEvalAugment.slow_drift_probability: 0.5
+EEGEvalAugment.slow_drift_frequency_hz: [0.05, 0.5]
+EEGEvalAugment.slow_drift_amplitude: [0.0, 0.15]
+EEGEvalAugment.baseline_shift_probability: 0.5
+EEGEvalAugment.baseline_shift_offset: [-0.15, 0.15]
+EEGEvalAugment.phase_shift_probability: 0.5
+EEGEvalAugment.phase_shift_max_radians: 0.785398
+EEGEvalAugment.line_noise_probability: 0.5
+EEGEvalAugment.line_noise_frequencies_hz: [50.0, 60.0]
+EEGEvalAugment.line_noise_amplitude: [0.0, 0.08]
+EEGEvalAugment.gaussian_noise_probability: 0.5
+EEGEvalAugment.gaussian_noise_std: [0.0, 0.1]
+EEGEvalAugment.signal_mix_probability: 0.5
+EEGEvalAugment.signal_mix_fraction: [0.0, 0.1]
+EEGEvalAugment.clip: 1.0
+
+EEGLoss.stft_windows: [64, 128, 256]
+EEGLoss.stft_mode: log_power
+
+train/build_dataset.files:
+  - /data/groups/bci/datasets/alice/Alice/cache/prep/*_cleaned_noref_raw.fif
+train/build_dataset.window_seconds: 10.0
+train/build_dataset.n_examples: 8192
+train/build_dataset.split: train
+train/build_dataset.train_fraction: 0.8
+train/build_dataset.clip_mad: 8.0
+train/build_dataset.normalization_seconds: 30.0
+train/build_dataset.normalization_chunks: 3
+train/build_dataset.seed: 0
+
+val/build_dataset.files:
+  - /data/groups/bci/datasets/alice/Alice/cache/prep/*_cleaned_noref_raw.fif
+val/build_dataset.window_seconds: 10.0
+val/build_dataset.n_examples: 1024
+val/build_dataset.split: val
+val/build_dataset.train_fraction: 0.8
+val/build_dataset.clip_mad: 8.0
+val/build_dataset.normalization_seconds: 30.0
+val/build_dataset.normalization_chunks: 3
+val/build_dataset.seed: 0
