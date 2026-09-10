@@ -1,14 +1,13 @@
 """
 # Run this script with: 
 
-CUDA_VISIBLE_DEVICES=5 python scripts/train_jm.py \
+CUDA_VISIBLE_DEVICES=0 python scripts/train_jm.py \
    --args.load conf/base_jm.yml \
    --batch_size 24 \
    --val_batch_size 24
 
 # VENV installation instructions (it's mostly the DAC requirements file, but with fixed versioning for some packages)
-
-python3.10 -m venv /data/groups/bci/jonas/venv_dac_audio                                                                                                                                                           
+  python3.10 -m venv /data/groups/bci/jonas/venv_dac_audio                                                                                                                                                           
   source /data/groups/bci/jonas/venv_dac_audio/bin/activate                                                                                                                                                          
                                                                                                                                                                                                                      
   python -m pip install --upgrade pip setuptools wheel
@@ -22,13 +21,23 @@ python3.10 -m venv /data/groups/bci/jonas/venv_dac_audio
     numpy==1.24.4 \
     numba==0.57.1 \
     argbind==0.3.9 \
-    descript-audiotools==0.7.2 \
     einops tqdm \
     tensorboard==2.13.0 \
     protobuf==3.19.6
 
-  cd /data/groups/bci/jonas/workspace/bci_descript-audio-codec
-  python -m pip install -e . --no-deps
+  # Install local audiotools fork
+  python -m pip install -e \
+    /data/groups/bci/jonas/workspace/bci_audiotools
+
+  # Install local DAC fork
+  python -m pip install -e \
+    /data/groups/bci/jonas/workspace/bci_descript-audio-codec \
+    --no-deps
+
+
+
+
+
 """
 
 import os
