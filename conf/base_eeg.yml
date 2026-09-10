@@ -74,7 +74,7 @@ AdamW.betas: [0.8, 0.99]
 AdamW.lr: 3.0e-05 #conservative for now, we probably want to increase this later
 ExponentialLR.gamma: 1.0
 amp: true #automatic mixed precision 
-batch_size: 12
+batch_size: 600 #12
 val_batch_size: 12
 num_iters: 20490       # 30 epochs x ceil(8192 / 12) batches
 valid_freq: 683        # validate once per epoch
@@ -93,7 +93,7 @@ save_path: runs/eeg_alice_all_teacher_student_dac_style
 WandB.enabled: true
 WandB.project: eeg-dac
 WandB.entity: ""
-WandB.name: eeg-alice-125ms-teacher-student
+WandB.name: eeg-alice-jm
 WandB.group: alice
 WandB.tags: [eeg, dac, teacher-student, 125ms]
 WandB.mode: online
