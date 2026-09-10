@@ -85,7 +85,11 @@ test/build_transform.augment_prob: 1.0
 test/AudioDataset.n_examples: 1000
 
 AudioLoader.shuffle: true
+# AudioLoader.EEG: true #jm
 AudioDataset.without_replacement: true
+
+
+
 
 train/build_dataset.folders:
   # speech_fb:

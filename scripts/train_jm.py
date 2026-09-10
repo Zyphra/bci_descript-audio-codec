@@ -1,10 +1,20 @@
 """
 # Run this script with: 
 
-CUDA_VISIBLE_DEVICES=0 python scripts/train_jm.py \
-   --args.load conf/base_jm.yml \
-   --batch_size 24 \
-   --val_batch_size 24
+CUDA_VISIBLE_DEVICES=5 python scripts/train_jm.py \
+   --args.load conf/base_jm_eeg.yml \
+   --batch_size 1 \
+   --val_batch_size 1 \
+   --val_batch_size 1 \
+   --num_workers 0
+
+CUDA_VISIBLE_DEVICES=5 python scripts/train_jm.py \
+   --args.load conf/base_jm_audio.yml \
+   --batch_size 1 \
+   --val_batch_size 1 \
+   --val_batch_size 1 \
+   --num_workers 0
+
 
 # VENV installation instructions (it's mostly the DAC requirements file, but with fixed versioning for some packages)
   python3.10 -m venv /data/groups/bci/jonas/venv_dac_audio                                                                                                                                                           
@@ -34,9 +44,7 @@ CUDA_VISIBLE_DEVICES=0 python scripts/train_jm.py \
     /data/groups/bci/jonas/workspace/bci_descript-audio-codec \
     --no-deps
 
-
-
-
+    # NEED TO ADD PIP INSTALL MNE
 
 """
 
@@ -52,9 +60,9 @@ from audiotools import AudioSignal
 from audiotools import ml
 from audiotools.core import util
 from audiotools.data import transforms
-from audiotools.data.datasets import AudioDataset
-from audiotools.data.datasets import AudioLoader
-from audiotools.data.datasets import ConcatDataset
+from audiotools.data.datasets_eeg import AudioDataset
+from audiotools.data.datasets_eeg import AudioLoader
+from audiotools.data.datasets_eeg import ConcatDataset
 from audiotools.ml.decorators import timer
 from audiotools.ml.decorators import Tracker
 from audiotools.ml.decorators import when
