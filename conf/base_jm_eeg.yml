@@ -57,9 +57,10 @@ build_transform.augment_prob: 0.0
 build_transform.augment:
   - Identity
 build_transform.postprocess:
-  - VolumeNorm
-  - RescaleAudio
-  - ShiftPhase
+  - Identity
+  # - VolumeNorm
+  # - RescaleAudio
+  # - ShiftPhase
 
 # Loss setup
 MultiScaleSTFTLoss.window_lengths: [2048, 512]
@@ -73,7 +74,7 @@ MelSpectrogramLoss.mag_weight: 0.0
 
 # Data
 batch_size: 72
-train/AudioDataset.duration: 0.38
+train/AudioDataset.duration: 5.0 #0.38 #0.38s at 256Hz = 96 samples, too short for the stft discriminator 
 train/AudioDataset.n_examples: 10000000
 
 val/AudioDataset.duration: 5.0

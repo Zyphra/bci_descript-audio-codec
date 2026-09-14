@@ -1,7 +1,7 @@
 """
 # Run this script with: 
 
-CUDA_VISIBLE_DEVICES=5 python scripts/train_jm.py \
+CUDA_VISIBLE_DEVICES=2 python scripts/train_jm.py \
    --args.load conf/base_jm_eeg.yml \
    --batch_size 1 \
    --val_batch_size 1 \
