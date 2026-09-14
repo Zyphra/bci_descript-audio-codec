@@ -29,12 +29,12 @@ AdamW.lr: 0.0001
 ExponentialLR.gamma: 0.999996
 
 amp: false
-val_batch_size: 100
+val_batch_size: 24 #100
 device: cuda
-num_iters: 250000
-save_iters: [10000, 50000, 100000, 200000]
+num_iters: 10000 #250000
+save_iters: [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000] #[10000, 50000, 100000, 200000]
 valid_freq: 1000
-sample_freq: 10000
+sample_freq: 1000 #10000
 num_workers: 32
 val_idx: [0, 1, 2, 3, 4, 5, 6, 7]
 seed: 0
@@ -47,16 +47,17 @@ lambdas:
 
 VolumeNorm.db: [const, -16]
 
-# Transforms
-build_transform.preprocess:
-  - Identity
-build_transform.augment_prob: 0.0
-build_transform.augment:
-  - Identity
-build_transform.postprocess:
-  - VolumeNorm
-  - RescaleAudio
-  - ShiftPhase
+# # Transforms [All become identity by default if commented out.]
+# build_transform.preprocess:
+#   - Identity
+# build_transform.augment_prob: 0.0
+# build_transform.augment:
+#   - Identity
+# build_transform.postprocess:
+#   - Identity
+#   # - VolumeNorm
+#   # - RescaleAudio
+#   # - ShiftPhase
 
 # Loss setup
 MultiScaleSTFTLoss.window_lengths: [2048, 512]
@@ -69,7 +70,7 @@ MelSpectrogramLoss.clamp_eps: 1.0e-5
 MelSpectrogramLoss.mag_weight: 0.0
 
 # Data
-batch_size: 72
+batch_size: 24 #72
 train/AudioDataset.duration: 0.38
 train/AudioDataset.n_examples: 10000000
 
@@ -82,42 +83,35 @@ test/build_transform.augment_prob: 1.0
 test/AudioDataset.n_examples: 1000
 
 AudioLoader.shuffle: true
+AudioLoader.: false
 AudioDataset.without_replacement: true
 
 train/build_dataset.folders:
-  speech_fb:
-    - /data/daps/train
-  speech_hq:
-    - /data/vctk
-    - /data/vocalset
-    - /data/read_speech
-    - /data/french_speech
-  speech_uq:
-    - /data/emotional_speech/
-    - /data/common_voice/
-    - /data/german_speech/
-    - /data/russian_speech/
-    - /data/spanish_speech/
-  music_hq:
-    - /data/musdb/train
-  music_uq:
-    - /data/jamendo
-  general:
-    - /data/audioset/data/unbalanced_train_segments/
-    - /data/audioset/data/balanced_train_segments/
+  EARS:
+    - /data/groups/bci/EARS
 
 val/build_dataset.folders:
-  speech_hq:
-    - /data/daps/val
-  music_hq:
-    - /data/musdb/test
-  general:
-    - /data/audioset/data/eval_segments/
+  EARS:
+    - /data/groups/bci/EARS
 
 test/build_dataset.folders:
-  speech_hq:
-    - /data/daps/test
-  music_hq:
-    - /data/musdb/test
-  general:
-    - /data/audioset/data/eval_segments/
+  EARS:
+    - /data/groups/bci/EARS
+
+
+# =============================================================================
+# Experiment tracking using tensorboard and/or wandb
+# =============================================================================
+
+save_path: runs/audio-dac_EARS_2
+
+# WandB.enabled: true
+# WandB.project: audio-dac
+# WandB.entity: ""
+# WandB.name: audio_EARS
+# WandB.group: EARS
+# WandB.tags: [audio, dac]
+# WandB.mode: online
+# WandB.log_freq: 1  # training scalars are logged after every optimizer step
+# WandB.log_reconstruction: true
+# WandB.watch_model: false

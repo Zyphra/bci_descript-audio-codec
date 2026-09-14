@@ -1,7 +1,8 @@
 """Train EEG with the original DAC training script's structure and config style.
 
-Run on the reserved physical GPU 3::
-    CUDA_VISIBLE_DEVICES=4 python scripts/train_cw.py --args.load conf/base_cw.yml
+Run on the reserved physical GPU XXX ::
+    CUDA_VISIBLE_DEVICES=5 python scripts/train_cw.py --args.load conf/base_cw.yml
+    CUDA_VISIBLE_DEVICES=5 python scripts/train_cw.py --args.load conf/base_cw_eeg.yml
 """
 
 import os
@@ -12,51 +13,128 @@ from pathlib import Path
 
 import argbind
 import torch
-
-# ------------------------------------------------------------
-#
-# ADDED FOR EEG
-
-import glob
-import json
-import math
-import random
-import shutil
-import tempfile
-import time
-from typing import Dict, Iterable, List, Sequence, Tuple
-
-_cache_root = Path(tempfile.gettempdir()) / f"eeg-dac-{os.getuid()}"
-os.environ.setdefault("NUMBA_CACHE_DIR", str(_cache_root / "numba"))
-os.environ.setdefault("MPLCONFIGDIR", str(_cache_root / "matplotlib"))
-
-import numpy as np
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
-
-from eegtools.data.datasets import EEGWindowDataset, load_recordings
-from eegtools.data.transforms import augment_eeg, EEGAugment
-from eegtools.core.loss import EEGLoss, compute_losses, latent_consistency_loss
-from eeg_plotting import training_plots
-
-#
-# ------------------------------------------------------------
-
-
-## Comment out audio stuff. (CW)
-# from audiotools import AudioSignal
+from audiotools import AudioSignal
 from audiotools import ml
-# from audiotools.core import util
-# from audiotools.data import transforms
-# from audiotools.data.datasets import AudioDataset
-# from audiotools.data.datasets import AudioLoader
-# from audiotools.data.datasets import ConcatDataset
-# from audiotools.ml.decorators import timer
-# from audiotools.ml.decorators import Tracker
-# from audiotools.ml.decorators import when
-# from torch.utils.tensorboard import SummaryWriter
+from audiotools.core import util
+from audiotools.data import transforms
+from audiotools.data.datasets_eeg import AudioDataset
+from audiotools.data.datasets_eeg import AudioLoader
+from audiotools.data.datasets_eeg import ConcatDataset
+from audiotools.ml.decorators import timer
+from audiotools.ml.decorators import Tracker
+from audiotools.ml.decorators import when
+from torch.utils.tensorboard import SummaryWriter
 
 import dac
+
+
+# (CW) - setup_wandb - to be moved somewhere else.
+if True:
+    # ADDED FOR EEG EXPERIMENT TRACKING: optional Weights & Biases configuration.
+    @argbind.bind()
+    def WandB(
+        enabled: bool = False,
+        project: str = "eeg-dac",
+        entity: str = "",
+        name: str = "eeg-alice",
+        group: str = "",
+        tags: list = ["eeg", "dac"],
+        mode: str = "online",
+        log_freq: int = 1,
+        log_reconstruction: bool = True,
+        watch_model: bool = False,
+    ) -> dict:
+        return {
+            "enabled": enabled,
+            "project": project,
+            "entity": entity,
+            "name": name,
+            "group": group,
+            "tags": tags,
+            "mode": mode,
+            "log_freq": log_freq,
+            "log_reconstruction": log_reconstruction,
+            "watch_model": watch_model,
+        }
+
+
+    # ADDED FOR EEG: one consistent, training-integrated diagnostic plot schedule.
+    @argbind.bind()
+    def EEGPlots(
+        enabled: bool = True,
+        every_epochs: int = 10,
+        n_examples: int = 16,
+        augmentation_examples: int = 5,
+        seconds: float = 5.0,
+        seed: int = 7,
+        psd_fmin: float = 1.0,
+        psd_fmax: float = 45.0,
+        psd_window_seconds: float = 1.0,
+    ) -> dict:
+        return locals()
+
+
+    def initialize_wandb(config: dict, args, output: Path, model: torch.nn.Module):
+        """Start an optional W&B run without making wandb a required dependency."""
+        if not config["enabled"]:
+            return None, None
+        try:
+            import wandb
+        except ImportError as error:
+            raise RuntimeError(
+                "W&B logging is enabled, but wandb is not installed. Run "
+                "`/data/groups/bci/jonas/venv_dac/bin/pip install wandb`, then `wandb login`."
+            ) from error
+
+        init_kwargs = {
+            "project": config["project"],
+            "name": config["name"],
+            "tags": config["tags"],
+            "mode": config["mode"],
+            "dir": str(output),
+            "config": dict(args),
+        }
+        if config["entity"]:
+            init_kwargs["entity"] = config["entity"]
+        if config["group"]:
+            init_kwargs["group"] = config["group"]
+        run = wandb.init(**init_kwargs)
+        # Per-batch training curves use training_step; epoch aggregates and
+        # validation curves use epoch.
+        wandb.define_metric("training_step")
+        wandb.define_metric("epoch")
+        wandb.define_metric("train/*", step_metric="training_step")
+        for namespace in (
+            "train (avg per epoch)/*",
+            "validation (per epoch)/*",
+            "robustness/*",
+            "timing/*",
+            "best/*",
+        ):
+            wandb.define_metric(namespace, step_metric="epoch")
+        run.config.update(
+            {
+                "model/parameter_count": sum(parameter.numel() for parameter in model.parameters()),
+                "model/hop_length": int(model.hop_length),
+                "model/token_rate_hz": float(model.sample_rate / model.hop_length),
+            },
+            allow_val_change=True,
+        )
+        if config["watch_model"]:
+            wandb.watch(model, log="gradients", log_freq=config["log_freq"])
+        return wandb, run
+
+
+    def save_run_configuration(args, output: Path) -> None:
+        """Save both the authored input and fully resolved run configuration."""
+        resolved = dict(args)
+        argbind.dump_args(resolved, output / "config_resolved.yml")
+        source_name = resolved.get("args.load")
+        if source_name:
+            source = Path(source_name).expanduser().resolve()
+            if source.is_file():
+                shutil.copy2(source, output / "config_input.yml")
+
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -79,18 +157,17 @@ def ExponentialLR(optimizer, gamma: float = 1.0):
 DAC = argbind.bind(dac.model.DAC)
 Discriminator = argbind.bind(dac.model.Discriminator)
 
-## Comment out audio stuff. (CW)
-# # Data
-# AudioDataset = argbind.bind(AudioDataset, "train", "val")
-# AudioLoader = argbind.bind(AudioLoader, "train", "val")
-#
-# # Transforms
-# filter_fn = lambda fn: hasattr(fn, "transform") and fn.__qualname__ not in [
-#     "BaseTransform",
-#     "Compose",
-#     "Choose",
-# ]
-# tfm = argbind.bind_module(transforms, "train", "val", filter_fn=filter_fn)
+# Data
+AudioDataset = argbind.bind(AudioDataset, "train", "val")
+AudioLoader = argbind.bind(AudioLoader, "train", "val")
+
+# Transforms
+filter_fn = lambda fn: hasattr(fn, "transform") and fn.__qualname__ not in [
+    "BaseTransform",
+    "Compose",
+    "Choose",
+]
+tfm = argbind.bind_module(transforms, "train", "val", filter_fn=filter_fn)
 
 # Loss
 filter_fn = lambda fn: hasattr(fn, "forward") and "Loss" in fn.__name__
@@ -102,74 +179,44 @@ def get_infinite_loader(dataloader):
         for batch in dataloader:
             yield batch
 
-## (CW) transforms for audio, comment out. EEG transforms moved into eegtools.data.transforms
-# @argbind.bind("train", "val")
-# def build_transform(
-#     augment_prob: float = 1.0,
-#     preprocess: list = ["Identity"],
-#     augment: list = ["Identity"],
-#     postprocess: list = ["Identity"],
-# ):
-#     to_tfm = lambda l: [getattr(tfm, x)() for x in l]
-#     preprocess = transforms.Compose(*to_tfm(preprocess), name="preprocess")
-#     augment = transforms.Compose(*to_tfm(augment), name="augment", prob=augment_prob)
-#     postprocess = transforms.Compose(*to_tfm(postprocess), name="postprocess")
-#     transform = transforms.Compose(preprocess, augment, postprocess)
-#     return transform
-
-
-## (CW) transforms for audio, comment out. 
-# @argbind.bind("train", "val", "test")
-# def build_dataset(
-#     sample_rate: int,
-#     folders: dict = None,
-# ):
-#     # Give one loader per key/value of dictionary, where
-#     # value is a list of folders. Create a dataset for each one.
-#     # Concatenate the datasets with ConcatDataset, which
-#     # cycles through them.
-#     datasets = []
-#     for _, v in folders.items():
-#         loader = AudioLoader(sources=v)
-#         transform = build_transform()
-#         dataset = AudioDataset(loader, sample_rate, transform=transform)
-#         datasets.append(dataset)
-#     dataset = ConcatDataset(datasets)
-#     dataset.transform = transform
-#     return dataset
-
 
 @argbind.bind("train", "val")
+def build_transform(
+    augment_prob: float = 1.0,
+    preprocess: list = ["Identity"],
+    augment: list = ["Identity"],
+    postprocess: list = ["Identity"],
+):
+    to_tfm = lambda l: [getattr(tfm, x)() for x in l]
+    preprocess = transforms.Compose(*to_tfm(preprocess), name="preprocess")
+    augment = transforms.Compose(*to_tfm(augment), name="augment", prob=augment_prob)
+    postprocess = transforms.Compose(*to_tfm(postprocess), name="postprocess")
+    transform = transforms.Compose(preprocess, augment, postprocess)
+    return transform
+
+
+@argbind.bind("train", "val", "test")
 def build_dataset(
     sample_rate: int,
-    files: list = None,
-    window_seconds: float = 10.0,
-    n_examples: int = 8192,
-    split: str = "train",
-    train_fraction: float = 0.8,
-    clip_mad: float = 8.0,
-    normalization_seconds: float = 30.0,
-    normalization_chunks: int = 3,
-    seed: int = 0,
-) -> EEGWindowDataset:
-    if files is None:
-        raise ValueError("build_dataset.files must list at least one FIF pattern")
-    recordings = load_recordings(
-        files, sample_rate, train_fraction, normalization_seconds, normalization_chunks
-    )
-    return EEGWindowDataset(
-        recordings, sample_rate, window_seconds, n_examples, train_fraction,
-        clip_mad, split, seed
-    )
+    folders: dict = None,
+):
+    # Give one loader per key/value of dictionary, where
+    # value is a list of folders. Create a dataset for each one.
+    # Concatenate the datasets with ConcatDataset, which
+    # cycles through them.
+    datasets = []
+    for _, v in folders.items():
+        loader = AudioLoader(sources=v)
+        transform = build_transform()
+        dataset = AudioDataset(loader, sample_rate, transform=transform)
+        datasets.append(dataset)
 
+        # print("Inside build_dataset")
+        # import ipdb; ipdb.set_trace()
 
-print("Inside train_cw.py inside build_dataset function")
-import IPython; print('\n\nDebug:'); IPython.embed(); import time;  time.sleep(0.3)
-
-
-# ============================================================================
-# State
-# ============================================================================
+    dataset = ConcatDataset(datasets)
+    dataset.transform = transform
+    return dataset
 
 
 @dataclass
@@ -192,10 +239,6 @@ class State:
 
     tracker: Tracker
 
-
-# ============================================================================
-# load
-# ============================================================================
 
 @argbind.bind(without_prefix=True)
 def load(
@@ -303,6 +346,9 @@ def train_loop(state, batch, accel, lambdas):
     state.generator.train()
     state.discriminator.train()
     output = {}
+
+    # print("Inside train_loop. What is batch?")
+    # import pdb; state.tracker.live.stop(); pdb.set_trace()
 
     batch = util.prepare_batch(batch, accel.device)
     with torch.no_grad():

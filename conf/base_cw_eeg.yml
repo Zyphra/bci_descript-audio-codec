@@ -1,0 +1,113 @@
+# Model setup
+DAC.sample_rate: 256                 # EEG: was 44100
+DAC.encoder_dim: 64
+DAC.encoder_rates: [2, 2, 2, 2]      # EEG: was [2, 4, 8, 8]; hop 16 -> 16 tokens/s (audio: hop 512 -> 86 tokens/s)
+DAC.decoder_dim: 1536
+DAC.decoder_rates: [2, 2, 2, 2]      # EEG: was [8, 8, 4, 2]
+
+# Quantization
+DAC.n_codebooks: 9
+DAC.codebook_size: 1024
+DAC.codebook_dim: 8
+DAC.quantizer_dropout: 1.0
+
+# Discriminator
+Discriminator.sample_rate: 256       # EEG: was 44100
+Discriminator.rates: []
+Discriminator.periods: [2, 3, 5, 7, 11]
+Discriminator.fft_sizes: [256, 128, 64]   # EEG: was [2048, 1024, 512]; windows must be << 1280-sample clip
+Discriminator.bands:
+  - [0.0, 0.1]
+  - [0.1, 0.25]
+  - [0.25, 0.5]
+  - [0.5, 0.75]
+  - [0.75, 1.0]
+
+# Optimization
+AdamW.betas: [0.8, 0.99]
+AdamW.lr: 0.0001
+ExponentialLR.gamma: 0.999996
+
+amp: false
+val_batch_size: 24
+device: cuda
+num_iters: 10000
+save_iters: [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000]
+valid_freq: 1000
+sample_freq: 1000
+num_workers: 32
+val_idx: [0, 1, 2, 3, 4, 5, 6, 7]
+seed: 0
+lambdas:
+  mel/loss: 15.0
+  adv/feat_loss: 2.0
+  adv/gen_loss: 1.0
+  vq/commitment_loss: 0.25
+  vq/codebook_loss: 1.0
+
+VolumeNorm.db: [const, -16]
+
+# Transforms
+# EEG: arrives in volts (~1e-5 peak). Decoder Tanh and mel clamp_eps=1e-5 assume ~[-1, 1].
+# +80 dB = x10^4 gain, then RescaleAudio clips anything exceeding |1|. (base_cw.yml: all Identity)
+VolumeChange.db: [const, 80]
+build_transform.postprocess:
+  - VolumeChange
+  - RescaleAudio
+
+# Loss setup
+MultiScaleSTFTLoss.window_lengths: [256, 64]                  # EEG: was [2048, 512]
+MelSpectrogramLoss.n_mels: [5, 10, 20, 40, 64]                # EEG: was [5, 10, 20, 40, 80, 160, 320]
+MelSpectrogramLoss.window_lengths: [16, 32, 64, 128, 256]     # EEG: was [32, 64, 128, 256, 512, 1024, 2048]
+MelSpectrogramLoss.mel_fmin: [0, 0, 0, 0, 0]                  # EEG: 5 entries to match
+MelSpectrogramLoss.mel_fmax: [null, null, null, null, null]   # EEG: 5 entries to match
+MelSpectrogramLoss.pow: 1.0
+MelSpectrogramLoss.clamp_eps: 1.0e-5
+MelSpectrogramLoss.mag_weight: 0.0
+
+# Data
+batch_size: 24
+train/AudioDataset.duration: 5.0     # EEG: was 0.38; 0.38 s = 97 samples crashes the MRD STFT padding
+train/AudioDataset.n_examples: 10000000
+
+val/AudioDataset.duration: 5.0
+val/build_transform.augment_prob: 1.0
+val/AudioDataset.n_examples: 250
+
+test/AudioDataset.duration: 10.0
+test/build_transform.augment_prob: 1.0
+test/AudioDataset.n_examples: 1000
+
+AudioLoader.shuffle: true
+AudioLoader.EEG: true                # EEG: was false; loads .fif via MNE, one random EEG channel per item
+AudioDataset.without_replacement: true
+
+train/build_dataset.folders:         # EEG: was EARS
+  alice:
+    - /data/groups/bci/datasets/alice/Alice/cache/prep
+
+val/build_dataset.folders:
+  alice:
+    - /data/groups/bci/datasets/alice/Alice/cache/prep
+
+test/build_dataset.folders:
+  alice:
+    - /data/groups/bci/datasets/alice/Alice/cache/prep
+
+
+# =============================================================================
+# Experiment tracking using tensorboard and/or wandb
+# =============================================================================
+
+save_path: runs/eeg-dac_alice_cw
+
+# WandB.enabled: true
+# WandB.project: eeg-dac
+# WandB.entity: ""
+# WandB.name: eeg_alice
+# WandB.group: alice
+# WandB.tags: [eeg, dac]
+# WandB.mode: online
+# WandB.log_freq: 1
+# WandB.log_reconstruction: true
+# WandB.watch_model: false
