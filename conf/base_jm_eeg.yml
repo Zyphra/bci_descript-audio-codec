@@ -51,16 +51,163 @@ lambdas:
 VolumeNorm.db: [const, -16]
 
 # Transforms
-build_transform.preprocess:
-  - Identity
+build_transform.preprocess: # preprocessing that's ALWAYS applied to the audio before any augmentation
+  - EEGNormalize
+EEGNormalize.target_std: 0.3
+EEGNormalize.clip: 1.0
+EEGNormalize.prob: 1.0
 build_transform.augment_prob: 0.0
-build_transform.augment:
+build_transform.augment: # augmentation that's applied to the audio with probability augment_prob
   - Identity
-build_transform.postprocess:
+build_transform.postprocess: # postprocessing that's ALWAYS applied to the audio after any augmentat
   - Identity
   # - VolumeNorm
   # - RescaleAudio
   # - ShiftPhase
+
+  # All possible options below
+
+  # - Identity              # leaves the signal unchanged
+
+#   - ClippingDistortion   # clips waveform, default 0-10% of the signal
+# ClippingDistortion.perc: [uniform, 0.0, 0.1]  # clipping percentile range
+# ClippingDistortion.prob: 1.0
+
+#   - Equalizer             # applies independent gain changes across frequency bands. Frequency bands are mel scaled and evenly spaced between 0 and Nyquist frequency (128 for 256Hz EEG) (we probably don't want mel for EEG). Roughly this for our EEG: 
+#   # 0.0–19.9 Hz
+#   # 19.9–40.3 Hz
+#   # 40.3–61.3 Hz
+#   # 61.3–82.9 Hz
+#   # 82.9–105.1 Hz
+#   # 105.1–128.0 Hz
+# Equalizer.eq_amount: [const, 1.0]  # maximum cut in dB, randomly between 0 and 90% redcution (1 = 90% reduction) 
+# Equalizer.n_bands: 6
+# Equalizer.prob: 1.0
+
+#   - Quantization          # reduces amplitude precision, i.e., quantizing in a fixed number of amplitude levels
+# Quantization.channels: [choice, [8, 32, 128, 256, 1024]]  # number of quantization levels randomly chosen 
+# Quantization.prob: 1.0
+
+#   - MuLawQuantization     # same as quantization above, but differen spacing. Finer spacing closer to 0, larger spacing further away. 
+# MuLawQuantization.channels: [choice, [8, 32, 128, 256, 1024]]
+# MuLawQuantization.prob: 1.0
+
+#   - NoiseFloor           # adds Gaussian noise at a specified noise-floor level
+# # NoiseFloor.db: [const, -50.0] #noise level measured in LUFS (adds too much noise for EEG, should be based on SD?)
+# NoiseFloor.db: [const, -85.0] #noise level roughly appropriate for EEG (based on pre-post plots)
+# NoiseFloor.prob: 1.0
+
+#   - BackgroundNoise      # mixes in a separate background-noise recording | CURRENTLY NOT WORKING! requires that we update the noise loader (make it MNE compatible) 
+# BackgroundNoise.snr: [uniform, 10.0, 30.0]
+# BackgroundNoise.sources: [path/to/noise.csv]
+# BackgroundNoise.weights: null
+# BackgroundNoise.eq_amount: [const, 1.0]
+# BackgroundNoise.n_bands: 3
+# BackgroundNoise.loudness_cutoff: null
+# BackgroundNoise.prob: 1.0
+
+#   - CrossTalk             # mixes signal from another recording | CURRENTLY NOT WORKING! requires that we update the noise loader (make it MNE compatible) 
+# CrossTalk.snr: [uniform, 0.0, 10.0]
+# CrossTalk.sources: [path/to/crosstalk.csv]
+# CrossTalk.weights: null
+# CrossTalk.loudness_cutoff: -40
+# CrossTalk.prob: 1.0
+
+#   - RoomImpulseResponse   # applies room reverberation using an impulse response | CURRENTLY NOT WORKING! requires that we add a impulse response file (I don't think it's applicable to EEG)
+# RoomImpulseResponse.drr: [uniform, 0.0, 30.0]
+# RoomImpulseResponse.sources: [path/to/impulse_responses.csv]
+# RoomImpulseResponse.weights: null
+# RoomImpulseResponse.eq_amount: [const, 1.0]
+# RoomImpulseResponse.n_bands: 6
+# RoomImpulseResponse.use_original_phase: false
+# RoomImpulseResponse.offset: 0.0
+# RoomImpulseResponse.duration: 1.0
+# RoomImpulseResponse.prob: 1.0
+
+#   - VolumeChange          # randomly decreases amplitude in dB up to -12dB = 1/4 of the original amplitude (for EEG, we might want to decrease this to -6dB = 1/2 of the original amplitude)
+# VolumeChange.db: [uniform, -12.0, 0.0]
+# VolumeChange.prob: 1.0
+
+#   - VolumeNorm            # normalizes signal loudness to a target dB value, it uses LUFS to measure audio loudness (so scaling parameter is audio specific). EEGNorm is our EEG version based on SD (works LOTS)
+# VolumeNorm.db: [const, -24]
+# VolumeNorm.prob: 1.0
+
+#   - GlobalVolumeNorm      # normalizes using a global/reference loudness value, requires metadata, will be skipped if metadata is not provided
+# GlobalVolumeNorm.db: [const, -24]
+# GlobalVolumeNorm.prob: 1.0
+
+#   - Silence               # replaces the ENTIRE signal with 0s at a likelihood of 01. (so it's not masking sub parts)
+# Silence.prob: 0.1
+
+#   - LowPass               # lowpass filter, adjust frequencies to EEG
+# # LowPass.cutoff: [choice, [4000, 8000, 16000]]
+# # LowPass.cutoff: [choice, [40, 45, 60]]
+# LowPass.cutoff: [choice, [20, 40]]
+# LowPass.zeros: 51
+# LowPass.prob: 1.0
+
+#   - HighPass              # highpass filter, adjust frequencies to EEG
+# # HighPass.cutoff: [choice, [50, 100, 250, 500, 1000]]
+# HighPass.cutoff: [choice, [0.1,1]]
+# HighPass.zeros: 51
+# HighPass.prob: 1.0
+
+#   - RescaleAudio          # rescakes signal so that max/min is equal to RescaleAudio.val. ONLY SCALES DOWN (not up) 
+# # RescaleAudio.val: 1.0
+# RescaleAudio.val: 0.6
+# RescaleAudio.prob: 1.0
+
+#   - ShiftPhase            # split signal into frequency components using STFT, default to 9 bins centered at 0, 16, 32, 48, 64, 80, 96, 112, 128 Hz. Each frequency component gets offset with the same phase angle, then windows are recombined. 
+#   # problem for EEG: time bins are very coarse for EEG, so we might want to change the STFT parameters (window size, hop size, etc.) to get more time bins. 
+# ShiftPhase.shift: [uniform, -3.14159, 3.14159]
+# ShiftPhase.prob: 1.0
+
+#   - InvertPhase           # shifts phase by pi, effectively inverting phase
+# InvertPhase.prob: 1.0
+
+#   - CorruptPhase          # adds a different random phase offset to each frequency bin in each time window, independently for each channel. (a bit like shift phase, but random)
+# CorruptPhase.scale: [uniform, 0.0, 3.14159]
+# CorruptPhase.prob: 1.0
+
+#   - FrequencyMask         # removes a selected frequency band, 12.8Hz wide between 0 and 128Hz (with 256Hz sampling rate)
+#   # we may want to focus this on EEG specific frequency bands
+# FrequencyMask.f_center: [uniform, 0.0, 1.0]
+# FrequencyMask.f_width: [const, 0.1]
+# FrequencyMask.prob: 1.0
+
+#   - TimeMask              # removes a selected time segment
+# TimeMask.t_center: [uniform, 0.0, 1.0] #center can be anywhere in the signal
+# # TimeMask.t_width: [const, 0.025] #default: 2.5% of the signal
+# TimeMask.t_width: [uniform, 0.025, 0.25] #EEG: 2.5% to 25% of the signal
+# TimeMask.prob: 1.0
+
+  - MaskLowMagnitudes     # removes spectral components below a magnitude threshold
+MaskLowMagnitudes.db_cutoff: [uniform, -10, 10]
+MaskLowMagnitudes.prob: 1.0
+
+  # - Smoothing              # smooths the waveform over a selected window
+  # Smoothing.window_type: [const, average]
+  # Smoothing.window_length: [choice, [8, 16, 32, 64, 128, 256, 512]]
+  # Smoothing.prob: 1.0
+
+  # - TimeNoise              # adds noise to a selected time segment
+  # TimeNoise.t_center: [uniform, 0.0, 1.0]
+  # TimeNoise.t_width: [const, 0.025]
+  # TimeNoise.prob: 1.0
+
+  # - FrequencyNoise         # adds noise to a selected frequency band
+  # FrequencyNoise.f_center: [uniform, 0.0, 1.0]
+  # FrequencyNoise.f_width: [const, 0.1]
+  # FrequencyNoise.prob: 1.0
+
+  # - SpectralDenoising      # estimates and reduces spectral noise
+  # SpectralDenoising.eq_amount: [const, 1.0]
+  # SpectralDenoising.denoise_amount: [uniform, 0.8, 1.0]
+  # SpectralDenoising.nz_volume: -40
+  # SpectralDenoising.n_bands: 6
+  # SpectralDenoising.n_freq: 3
+  # SpectralDenoising.n_time: 5
+  # SpectralDenoising.prob: 1.0
 
 # Loss setup
 MultiScaleSTFTLoss.window_lengths: [2048, 512]

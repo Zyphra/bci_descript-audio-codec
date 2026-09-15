@@ -279,10 +279,59 @@ def train_loop(state, batch, accel, lambdas):
     output = {}
 
     batch = util.prepare_batch(batch, accel.device)
+    if True: #jm
+        original = batch["signal"].clone()
+        normalized = batch["signal"].clone()
     with torch.no_grad():
+        if True: #jm
+            with state.train_data.transform.filter("preprocess"):
+                normalized = state.train_data.transform(
+                    normalized, **batch["transform_args"]
+                )
         signal = state.train_data.transform(
             batch["signal"].clone(), **batch["transform_args"]
         )
+    if True: #jm
+        import matplotlib.pyplot as plt
+        import numpy as np
+
+        transform_name = "Identity"
+        for stage in state.train_data.transform.transforms:
+            for transform in stage.transforms:
+                if transform.__class__.__name__ != "Identity":
+                    transform_name = transform.__class__.__name__
+        plot_dir = Path("runs/transform_plots")
+        plot_dir.mkdir(parents=True, exist_ok=True)
+
+        def plot_original_vs_normalized_vs_transformed(
+            original, normalized, transformed, path
+        ):
+            original_data = original.audio_data[0, 0].detach().cpu().numpy()
+            normalized_data = normalized.audio_data[0, 0].detach().cpu().numpy()
+            transformed_data = transformed.audio_data[0, 0].detach().cpu().numpy()
+            original_time = np.arange(len(original_data)) / original.sample_rate
+            normalized_time = np.arange(len(normalized_data)) / normalized.sample_rate
+            transformed_time = np.arange(len(transformed_data)) / transformed.sample_rate
+
+            plt.figure(figsize=(15, 5))
+            plt.plot(original_time, original_data, label="Original", color="green", alpha=0.7)
+            plt.plot(normalized_time, normalized_data, label="Normalized", color="tab:blue", alpha=0.7)
+            plt.plot(transformed_time, transformed_data, label="Transformed", color="tab:orange", alpha=0.7)
+            plt.xlabel("Time (seconds)")
+            plt.ylabel("Amplitude")
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(path)
+            plt.close()
+
+
+        plot_original_vs_normalized_vs_transformed(
+            original,
+            normalized,
+            signal,
+            plot_dir / f"{transform_name}.png",
+        )
+        import pdb; pdb.set_trace()
 
     with accel.autocast():
         out = state.generator(signal.audio_data, signal.sample_rate)
