@@ -14,7 +14,7 @@ DAC.quantizer_dropout: 1.0
 # Discriminator
 Discriminator.sample_rate: 256       # EEG: was 44100
 Discriminator.rates: []
-Discriminator.periods: [2, 3, 5, 7, 11]
+Discriminator.periods: [] # [2, 3, 5, 7, 11]
 Discriminator.fft_sizes: [256, 128, 64]   # EEG: was [2048, 1024, 512]; windows must be << 1280-sample clip
 Discriminator.bands:
   - [0.0, 0.1]
@@ -39,21 +39,27 @@ num_workers: 32
 val_idx: [0, 1, 2, 3, 4, 5, 6, 7]
 seed: 0
 lambdas:
-  mel/loss: 15.0
-  adv/feat_loss: 2.0
-  adv/gen_loss: 1.0
+  mel/loss: 0.0 # 15.0
+  stft/loss: 15.0 # 0.0     # default to 0.0, not in DAC for audio
+  waveform/loss: 15.0 #0.0 # default to 0.0, not in DAC for audio
+  adv/feat_loss: 0.0 # 2.0
+  adv/gen_loss: 0.0 # 1.0
   vq/commitment_loss: 0.25
   vq/codebook_loss: 1.0
 
-VolumeNorm.db: [const, -16]
+# VolumeNorm.db: [const, -16]
 
 # Transforms
-# EEG: arrives in volts (~1e-5 peak). Decoder Tanh and mel clamp_eps=1e-5 assume ~[-1, 1].
-# +80 dB = x10^4 gain, then RescaleAudio clips anything exceeding |1|. (base_cw.yml: all Identity)
-VolumeChange.db: [const, 80]
-build_transform.postprocess:
-  - VolumeChange
-  - RescaleAudio
+build_transform.preprocess: # before augmentation
+  - EEGNormalize
+EEGNormalize.target_std: 0.3
+EEGNormalize.clip: 1.0
+EEGNormalize.prob: 1.0
+build_transform.augment_prob: 0.0
+build_transform.augment:
+  - Identity
+build_transform.postprocess: # after augmentation
+  - Identity
 
 # Loss setup
 MultiScaleSTFTLoss.window_lengths: [256, 64]                  # EEG: was [2048, 512]
@@ -99,15 +105,16 @@ test/build_dataset.folders:
 # Experiment tracking using tensorboard and/or wandb
 # =============================================================================
 
-save_path: runs/eeg-dac_alice_cw
+save_path: runs/dac-eeg_alice_cw_0
 
-# WandB.enabled: true
-# WandB.project: eeg-dac
-# WandB.entity: ""
-# WandB.name: eeg_alice
-# WandB.group: alice
-# WandB.tags: [eeg, dac]
-# WandB.mode: online
-# WandB.log_freq: 1
-# WandB.log_reconstruction: true
-# WandB.watch_model: false
+WandB.enabled: true
+WandB.project: dac-eeg-cw
+WandB.entity: ""
+WandB.name: eeg_alice_cw_0
+WandB.group: alice
+WandB.tags: [eeg, dac]
+WandB.mode: online
+WandB.log_freq: 1
+WandB.log_reconstruction: true
+WandB.stft_window_length: 256 # samples; linear-frequency visualization
+WandB.watch_model: false

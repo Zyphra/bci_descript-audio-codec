@@ -83,7 +83,7 @@ test/build_transform.augment_prob: 1.0
 test/AudioDataset.n_examples: 1000
 
 AudioLoader.shuffle: true
-AudioLoader.: false
+AudioLoader.EEG: false
 AudioDataset.without_replacement: true
 
 train/build_dataset.folders:
@@ -105,13 +105,14 @@ test/build_dataset.folders:
 
 save_path: runs/audio-dac_EARS_2
 
-# WandB.enabled: true
-# WandB.project: audio-dac
-# WandB.entity: ""
-# WandB.name: audio_EARS
-# WandB.group: EARS
-# WandB.tags: [audio, dac]
-# WandB.mode: online
-# WandB.log_freq: 1  # training scalars are logged after every optimizer step
-# WandB.log_reconstruction: true
-# WandB.watch_model: false
+WandB.enabled: true
+WandB.project: audio-dac
+WandB.entity: ""
+WandB.name: audio_EARS
+WandB.group: EARS
+WandB.tags: [audio, dac]
+WandB.mode: online
+WandB.log_freq: 1  # training scalars are logged after every optimizer step
+WandB.log_reconstruction: true
+WandB.stft_window_length: 2048 # samples; linear-frequency visualization
+WandB.watch_model: false
