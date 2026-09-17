@@ -1,7 +1,11 @@
 """
 # Run this script with: 
 
-CUDA_VISIBLE_DEVICES=2 python scripts/train_jm.py \
+CUDA_VISIBLE_DEVICES=4 python scripts/train_jm.py --args.load conf/base_jm_eeg.yml
+
+
+
+CUDA_VISIBLE_DEVICES=4 python scripts/train_jm.py \
    --args.load conf/base_jm_eeg.yml \
    --batch_size 1 \
    --val_batch_size 1 \
@@ -44,11 +48,15 @@ CUDA_VISIBLE_DEVICES=5 python scripts/train_jm.py \
     /data/groups/bci/jonas/workspace/bci_descript-audio-codec \
     --no-deps
 
-    # NEED TO ADD PIP INSTALL MNE
+    # NEED TO ADD PIP INSTALL 
+    # MNE
+    # wandb
 
 """
 
 import os
+import shutil
+from contextlib import ExitStack
 import sys
 import warnings
 from dataclasses import dataclass
@@ -69,6 +77,112 @@ from audiotools.ml.decorators import when
 from torch.utils.tensorboard import SummaryWriter
 
 import dac
+
+
+# ADDED FOR EEG EXPERIMENT TRACKING: optional Weights & Biases configuration.
+@argbind.bind()
+def WandB(
+    enabled: bool = False,
+    project: str = "eeg-dac",
+    entity: str = "",
+    name: str = "eeg-alice",
+    group: str = "",
+    tags: list = ["eeg", "dac"],
+    mode: str = "online",
+    log_freq: int = 1,
+    log_reconstruction: bool = True,
+    stft_window_length: int = 256,
+    watch_model: bool = False,
+) -> dict:
+    if log_freq < 1:
+        raise ValueError("WandB.log_freq must be at least 1")
+    if stft_window_length < 4:
+        raise ValueError("WandB.stft_window_length must be at least 4")
+    return {
+        "enabled": enabled,
+        "project": project,
+        "entity": entity,
+        "name": name,
+        "group": group,
+        "tags": tags,
+        "mode": mode,
+        "log_freq": log_freq,
+        "log_reconstruction": log_reconstruction,
+        "stft_window_length": stft_window_length,
+        "watch_model": watch_model,
+    }
+
+
+# ADDED FOR EEG: one consistent, training-integrated diagnostic plot schedule.
+@argbind.bind()
+def EEGPlots(
+    enabled: bool = True,
+    every_epochs: int = 10,
+    n_examples: int = 16,
+    augmentation_examples: int = 5,
+    seconds: float = 5.0,
+    seed: int = 7,
+    psd_fmin: float = 1.0,
+    psd_fmax: float = 45.0,
+    psd_window_seconds: float = 1.0,
+) -> dict:
+    return locals()
+
+
+def initialize_wandb(config: dict, args, output: Path, model: torch.nn.Module):
+    """Start an optional W&B run without making wandb a required dependency."""
+    if not config["enabled"]:
+        return None, None
+    try:
+        import wandb
+    except ImportError as error:
+        raise RuntimeError(
+            "W&B logging is enabled, but wandb is not installed. Run "
+            "`python -m pip install wandb`, then `wandb login`."
+        ) from error
+
+    init_kwargs = {
+        "project": config["project"],
+        "name": config["name"],
+        "tags": config["tags"],
+        "mode": config["mode"],
+        "dir": str(output),
+        "config": dict(args),
+    }
+    if config["entity"]:
+        init_kwargs["entity"] = config["entity"]
+    if config["group"]:
+        init_kwargs["group"] = config["group"]
+    run = wandb.init(**init_kwargs)
+    # This trainer is iteration-based; validation uses the same step axis.
+    run.define_metric("training_step")
+    for namespace in ("train/*", "val/*"):
+        run.define_metric(namespace, step_metric="training_step")
+    run.define_metric("reconstruction_step")
+    run.define_metric("reconstruction/*", step_metric="reconstruction_step", summary="none")
+    run.config.update(
+        {
+            "model/parameter_count": sum(parameter.numel() for parameter in model.parameters()),
+            "model/hop_length": int(model.hop_length),
+            "model/token_rate_hz": float(model.sample_rate / model.hop_length),
+        },
+        allow_val_change=True,
+    )
+    if config["watch_model"]:
+        wandb.watch(model, log="gradients", log_freq=config["log_freq"])
+    return wandb, run
+
+
+def save_run_configuration(args, output: Path) -> None:
+    """Save both the authored input and fully resolved run configuration."""
+    resolved = dict(args)
+    argbind.dump_args(resolved, output / "config_resolved.yml")
+    source_name = resolved.get("args.load")
+    if source_name:
+        source = Path(source_name).expanduser().resolve()
+        if source.is_file():
+            shutil.copy2(source, output / "config_input.yml")
+
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -279,11 +393,11 @@ def train_loop(state, batch, accel, lambdas):
     output = {}
 
     batch = util.prepare_batch(batch, accel.device)
-    if True: #jm
+    if False: #jm
         original = batch["signal"].clone()
         normalized = batch["signal"].clone()
     with torch.no_grad():
-        if True: #jm
+        if False: #jm
             with state.train_data.transform.filter("preprocess"):
                 normalized = state.train_data.transform(
                     normalized, **batch["transform_args"]
@@ -291,7 +405,7 @@ def train_loop(state, batch, accel, lambdas):
         signal = state.train_data.transform(
             batch["signal"].clone(), **batch["transform_args"]
         )
-    if True: #jm
+    if False: #jm
         import matplotlib.pyplot as plt
         import numpy as np
 
@@ -410,15 +524,64 @@ def checkpoint(state, save_iters, save_path):
         )
 
 
+def reconstruction_figures(target, reconstruction, sample_rate, window_length, title):
+    """Plot full waveforms and linear-frequency STFTs with a shared dB scale."""
+    from matplotlib.figure import Figure
+
+    target = target.detach().float().cpu().flatten()
+    reconstruction = reconstruction.detach().float().cpu().flatten()
+    time = torch.arange(target.numel()).numpy() / sample_rate
+    waveform = Figure(figsize=(12, 3), layout="constrained")
+    ax = waveform.subplots()
+    ax.plot(time, target.numpy(), color="#0072B2", linewidth=0.6, label="Target")
+    ax.plot(time, reconstruction.numpy(), color="#D55E00", linewidth=0.6,
+            alpha=0.85, label="Reconstruction")
+    ax.set(xlabel="Time (s)", ylabel="Amplitude (model input units)", title=title)
+    ax.legend(loc="upper right")
+    ax.grid(alpha=0.2)
+
+    # Constant padding also supports clips shorter than the FFT window.
+    hop = max(1, window_length // 4)
+    window = torch.hann_window(window_length)
+    signals = torch.stack([target, reconstruction])
+    magnitude = torch.stft(
+        signals, n_fft=window_length, hop_length=hop, window=window,
+        center=True, pad_mode="constant", return_complex=True,
+    ).abs() / window.sum()
+    db = 20 * magnitude.clamp_min(1e-10).log10()
+    vmax = float(db.max())
+    vmin = vmax - 80.0
+    frequencies = torch.fft.rfftfreq(window_length, d=1.0 / sample_rate).numpy()
+    times = torch.arange(db.shape[-1]).numpy() * hop / sample_rate
+    spectrogram = Figure(figsize=(12, 4), layout="constrained")
+    axes = spectrogram.subplots(1, 2, sharex=True, sharey=True)
+    for ax, values, label in zip(axes, db, ("Target", "Reconstruction")):
+        mesh = ax.pcolormesh(times, frequencies, values.numpy(), shading="auto",
+                             cmap="magma", vmin=vmin, vmax=vmax)
+        ax.set(title=label, xlabel="Time (s)", xlim=(0, target.numel() / sample_rate),
+               ylim=(0, sample_rate / 2))
+    axes[0].set_ylabel("Frequency (Hz)")
+    spectrogram.colorbar(mesh, ax=list(axes), label="STFT magnitude (dB re 1 input unit)")
+    spectrogram.suptitle(f"{title} — STFT ({window_length} samples, hop {hop})")
+    return waveform, spectrogram
+
+
+def reconstruction_due(completed_steps, save_iters, sample_freq, last_iter):
+    """Use completed iteration counts, including num_iters on the last update."""
+    return (completed_steps == 1 or completed_steps in save_iters or last_iter
+            or (sample_freq > 0 and completed_steps % sample_freq == 0))
+
+
 @torch.no_grad()
-def save_samples(state, val_idx, writer):
+def save_samples(state, val_idx, writer, wandb=None, wandb_run=None,
+                 save_path=None, stft_window_length=256):
     state.tracker.print("Saving audio samples to TensorBoard")
     state.generator.eval()
 
     samples = [state.val_data[idx] for idx in val_idx]
     batch = state.val_data.collate(samples)
     batch = util.prepare_batch(batch, accel.device)
-    signal = state.train_data.transform(
+    signal = state.val_data.transform(
         batch["signal"].clone(), **batch["transform_args"]
     )
 
@@ -434,6 +597,32 @@ def save_samples(state, val_idx, writer):
             v[nb].cpu().write_audio_to_tb(
                 f"{k}/sample_{nb}.wav", writer, state.tracker.step
             )
+
+    if wandb_run is not None:
+        completed_steps = state.tracker.step + 1
+        plots = {"training_step": state.tracker.step,
+                 "reconstruction_step": completed_steps}
+        output = Path(save_path) / "plots" / f"step_{completed_steps:06d}"
+        output.mkdir(parents=True, exist_ok=True)
+        for nb, idx in enumerate(val_idx):
+            figures = reconstruction_figures(
+                signal.audio_data[nb, 0], recons.audio_data[nb, 0],
+                signal.sample_rate, stft_window_length,
+                f"Sample {idx} · iteration {completed_steps}",
+            )
+            for kind, figure in zip(("waveform", "stft"), figures):
+                try:
+                    path = output / f"sample_{idx}_{kind}.png"
+                    figure.savefig(path, dpi=160)
+                    plots[f"reconstruction/{kind}_{idx}"] = wandb.Image(
+                        str(path), caption=f"Sample {idx}, iteration {completed_steps}"
+                    )
+                    if writer is not None:
+                        writer.add_figure(f"reconstruction/{kind}_{idx}", figure,
+                                          global_step=completed_steps, close=False)
+                finally:
+                    figure.clear()
+        wandb_run.log(plots)
 
 
 def validate(state, val_dataloader, accel):
@@ -508,24 +697,62 @@ def train(
     save_samples = when(lambda: accel.local_rank == 0)(save_samples)
     checkpoint = when(lambda: accel.local_rank == 0)(checkpoint)
 
-    with tracker.live:
-        for tracker.step, batch in enumerate(train_dataloader, start=tracker.step):
-            train_loop(state, batch, accel, lambdas)
-
-            last_iter = (
-                tracker.step == num_iters - 1 if num_iters is not None else False
+    wandb_config = WandB()
+    # Use the global rank so multi-process launches create only one W&B run.
+    is_primary = int(os.environ.get("RANK", accel.local_rank)) == 0
+    with ExitStack() as stack:
+        if writer is not None:
+            stack.callback(writer.close)
+        wandb, wandb_run = None, None
+        if is_primary:
+            save_run_configuration(args, Path(save_path))
+            wandb, wandb_run = initialize_wandb(
+                wandb_config, args, Path(save_path), accel.unwrap(state.generator)
             )
-            if tracker.step % sample_freq == 0 or last_iter:
-                save_samples(state, val_idx, writer)
+            if wandb_run is not None:
+                stack.enter_context(wandb_run)
 
-            if tracker.step % valid_freq == 0 or last_iter:
-                validate(state, val_dataloader, accel)
-                checkpoint(state, save_iters, save_path)
-                # Reset validation progress bar, print summary since last validation.
-                tracker.done("val", f"Iteration {tracker.step}")
+        with tracker.live:
+            for tracker.step, batch in enumerate(train_dataloader, start=tracker.step):
+                output = train_loop(state, batch, accel, lambdas)
 
-            if last_iter:
-                break
+                last_iter = (
+                    tracker.step == num_iters - 1 if num_iters is not None else False
+                )
+                if wandb_run is not None and (
+                    tracker.step % wandb_config["log_freq"] == 0 or last_iter
+                ):
+                    wandb_run.log({
+                        "training_step": tracker.step,
+                        **{f"train/{key}": value for key, value in output.items()
+                           if isinstance(value, (int, float))},
+                    })
+                if reconstruction_due(tracker.step + 1, save_iters, sample_freq, last_iter):
+                    save_samples(
+                        state, val_idx, writer, wandb,
+                        wandb_run if wandb_config["log_reconstruction"] else None,
+                        save_path, wandb_config["stft_window_length"],
+                    )
+
+                if tracker.step % valid_freq == 0 or last_iter:
+                    validate(state, val_dataloader, accel)
+                    if wandb_run is not None:
+                        # Tracker stores the full validation pass means, whereas
+                        # validate() returns only the final batch's output.
+                        metrics = {
+                            key: values[-1]
+                            for key, values in tracker.history["val"].items()
+                            if key != "step"
+                        }
+                        wandb_run.log({
+                            "training_step": tracker.step,
+                            **{f"val/{key}": value for key, value in metrics.items()},
+                        })
+                    checkpoint(state, save_iters, save_path)
+                    tracker.done("val", f"Iteration {tracker.step}")
+
+                if last_iter:
+                    break
 
 
 if __name__ == "__main__":
