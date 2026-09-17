@@ -9,12 +9,12 @@ DAC.decoder_rates: [2, 2, 2, 2]      # EEG: was [8, 8, 4, 2]
 DAC.n_codebooks: 9
 DAC.codebook_size: 1024
 DAC.codebook_dim: 8
-DAC.quantizer_dropout: 1.0
+DAC.quantizer_dropout: 0.0 # 1.0
 
 # Discriminator
 Discriminator.sample_rate: 256       # EEG: was 44100
 Discriminator.rates: []
-Discriminator.periods: [] # [2, 3, 5, 7, 11]
+Discriminator.periods: [2, 3, 5, 7, 11]
 Discriminator.fft_sizes: [256, 128, 64]   # EEG: was [2048, 1024, 512]; windows must be << 1280-sample clip
 Discriminator.bands:
   - [0.0, 0.1]
@@ -29,10 +29,10 @@ AdamW.lr: 0.0001
 ExponentialLR.gamma: 0.999996
 
 amp: false
-val_batch_size: 24
+val_batch_size: 128 # 24 
 device: cuda
-num_iters: 10000
-save_iters: [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000]
+num_iters: 20000
+save_iters: [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000, 11000, 12000, 13000, 14000, 15000, 16000, 17000, 18000, 19000, 20000]
 valid_freq: 1000
 sample_freq: 1000
 num_workers: 32
@@ -72,7 +72,7 @@ MelSpectrogramLoss.clamp_eps: 1.0e-5
 MelSpectrogramLoss.mag_weight: 0.0
 
 # Data
-batch_size: 24
+batch_size: 128 #24
 train/AudioDataset.duration: 5.0     # EEG: was 0.38; 0.38 s = 97 samples crashes the MRD STFT padding
 train/AudioDataset.n_examples: 10000000
 
@@ -85,32 +85,32 @@ test/build_transform.augment_prob: 1.0
 test/AudioDataset.n_examples: 1000
 
 AudioLoader.shuffle: true
-AudioLoader.EEG: true                # EEG: was false; loads .fif via MNE, one random EEG channel per item
+AudioLoader.EEG: true                # true for EEG; false for audio
 AudioDataset.without_replacement: true
 
-train/build_dataset.folders:         # EEG: was EARS
+train/build_dataset.folders:         
   alice:
-    - /data/groups/bci/datasets/alice/Alice/cache/prep
+    - /data/groups/bci/datasets/alice/Alice/cache/prep2/train
 
 val/build_dataset.folders:
   alice:
-    - /data/groups/bci/datasets/alice/Alice/cache/prep
+    - /data/groups/bci/datasets/alice/Alice/cache/prep2/val
 
-test/build_dataset.folders:
-  alice:
-    - /data/groups/bci/datasets/alice/Alice/cache/prep
+# test/build_dataset.folders: # NOT USING RIGHT NOW.
+#   alice:
+#     - /data/groups/bci/datasets/alice/Alice/cache/prep2/test
 
 
 # =============================================================================
 # Experiment tracking using tensorboard and/or wandb
 # =============================================================================
 
-save_path: runs/dac-eeg_alice_cw_0
+save_path: runs/dac-eeg_alice_cw_5
 
 WandB.enabled: true
 WandB.project: dac-eeg-cw
 WandB.entity: ""
-WandB.name: eeg_alice_cw_0
+WandB.name: eeg_alice_cw_5
 WandB.group: alice
 WandB.tags: [eeg, dac]
 WandB.mode: online
