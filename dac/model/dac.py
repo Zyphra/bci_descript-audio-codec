@@ -304,6 +304,8 @@ class DAC(BaseModel, CodecMixin):
                 Number of samples in input audio
             "audio" : Tensor[B x 1 x length]
                 Decoded audio data.
+            "codebook_mask" : BoolTensor[B x N]
+                Active quantizer stages per example, excluding dropout stages.
         """
         length = audio_data.shape[-1]
         audio_data = self.preprocess(audio_data, sample_rate)
@@ -316,6 +318,7 @@ class DAC(BaseModel, CodecMixin):
             "audio": x[..., :length],
             "z": z,
             "codes": codes,
+            "codebook_mask": self.quantizer.last_active_mask,
             "latents": latents,
             "vq/commitment_loss": commitment_loss,
             "vq/codebook_loss": codebook_loss,

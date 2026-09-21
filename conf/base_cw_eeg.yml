@@ -9,7 +9,7 @@ DAC.decoder_rates: [2, 2, 2, 2]      # EEG: was [8, 8, 4, 2]
 DAC.n_codebooks: 9
 DAC.codebook_size: 1024
 DAC.codebook_dim: 8
-DAC.quantizer_dropout: 0.0 # 1.0
+DAC.quantizer_dropout: 1.0
 
 # Discriminator
 Discriminator.sample_rate: 256       # EEG: was 44100
@@ -40,7 +40,7 @@ val_idx: [0, 1, 2, 3, 4, 5, 6, 7]
 seed: 0
 lambdas:
   mel/loss: 0.0 # 15.0
-  stft/loss: 15.0 # 0.0     # default to 0.0, not in DAC for audio
+  stft/loss: 15.0 #0.0     # default to 0.0, not in DAC for audio
   waveform/loss: 15.0 #0.0 # default to 0.0, not in DAC for audio
   adv/feat_loss: 0.0 # 2.0
   adv/gen_loss: 0.0 # 1.0
@@ -105,12 +105,12 @@ val/build_dataset.folders:
 # Experiment tracking using tensorboard and/or wandb
 # =============================================================================
 
-save_path: runs/dac-eeg_alice_cw_5
+save_path: runs/dac-eeg_alice_cw_10
 
 WandB.enabled: true
 WandB.project: dac-eeg-cw
 WandB.entity: ""
-WandB.name: eeg_alice_cw_5
+WandB.name: eeg_alice_cw_10
 WandB.group: alice
 WandB.tags: [eeg, dac]
 WandB.mode: online

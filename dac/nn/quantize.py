@@ -159,6 +159,7 @@ class ResidualVectorQuantize(nn.Module):
         codebook_loss = 0
 
         codebook_indices = []
+        active_masks = []
         latents = []
 
         if n_quantizers is None:
@@ -182,6 +183,7 @@ class ResidualVectorQuantize(nn.Module):
             mask = (
                 torch.full((z.shape[0],), fill_value=i, device=z.device) < n_quantizers
             )
+            active_masks.append(mask)
             z_q = z_q + z_q_i * mask[:, None, None]
             residual = residual - z_q_i
 
@@ -192,6 +194,8 @@ class ResidualVectorQuantize(nn.Module):
             codebook_indices.append(indices_i)
             latents.append(z_e_i)
 
+        # Expose the exact dropout mask without changing the encode tuple API.
+        self.last_active_mask = torch.stack(active_masks, dim=1).detach()
         codes = torch.stack(codebook_indices, dim=1)
         latents = torch.cat(latents, dim=1)
 

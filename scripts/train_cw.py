@@ -32,6 +32,7 @@ from audiotools.ml.decorators import when
 from torch.utils.tensorboard import SummaryWriter
 
 import dac
+from dac.utils.provenance import create_launch_record, link_wandb_launch
 
 
 # ADDED FOR EEG EXPERIMENT TRACKING: optional Weights & Biases configuration.
@@ -191,15 +192,22 @@ def managed_wandb_run(wandb, run, interrupt_timeout):
             raise
 
 
-def save_run_configuration(args, output: Path) -> None:
-    """Save both the authored input and fully resolved run configuration."""
+def save_run_configuration(args, output: Path) -> Path:
+    """Save immutable per-launch configs/code, plus the legacy latest configs."""
+    launch = create_launch_record(output, {
+        "dac": Path(dac.__file__).resolve().parent,
+        "audiotools": Path(sys.modules["audiotools"].__file__).resolve().parent,
+    })
     resolved = dict(args)
-    argbind.dump_args(resolved, output / "config_resolved.yml")
+    argbind.dump_args(resolved, launch / "config_resolved.yml")
+    shutil.copy2(launch / "config_resolved.yml", output / "config_resolved.yml")
     source_name = resolved.get("args.load")
     if source_name:
         source = Path(source_name).expanduser().resolve()
         if source.is_file():
-            shutil.copy2(source, output / "config_input.yml")
+            shutil.copy2(source, launch / "config_input.yml")
+            shutil.copy2(launch / "config_input.yml", output / "config_input.yml")
+    return launch
 
 
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -411,14 +419,10 @@ def val_loop(batch, state, accel, codebook_counts=None):
     recons = AudioSignal(out["audio"], signal.sample_rate)
 
     if codebook_counts is not None:
-        codes = out["codes"].detach()
-        for q in range(codes.shape[1]):
-            codebook_counts[q].add_(torch.bincount(
-                codes[:, q, :].reshape(-1), minlength=codebook_counts.shape[1]
-            ))
+        accumulate_codebook_counts(codebook_counts, out["codes"])
 
     return {
-        "loss": state.mel_loss(recons, signal),
+        "loss": state.waveform_loss(recons, signal) + state.stft_loss(recons, signal),
         "mel/loss": state.mel_loss(recons, signal),
         "stft/loss": state.stft_loss(recons, signal),
         "waveform/loss": state.waveform_loss(recons, signal),
@@ -426,7 +430,7 @@ def val_loop(batch, state, accel, codebook_counts=None):
 
 
 @timer()
-def train_loop(state, batch, accel, lambdas):
+def train_loop(state, batch, accel, lambdas, codebook_counts=None):
     state.generator.train()
     if state.use_gan:
         state.discriminator.train()
@@ -446,6 +450,9 @@ def train_loop(state, batch, accel, lambdas):
         recons = AudioSignal(out["audio"], signal.sample_rate)
         commitment_loss = out["vq/commitment_loss"]
         codebook_loss = out["vq/codebook_loss"]
+
+    if codebook_counts is not None:
+        accumulate_codebook_counts(codebook_counts, out["codes"], out["codebook_mask"])
 
 
     if False:
@@ -497,10 +504,12 @@ def train_loop(state, batch, accel, lambdas):
 
 def checkpoint(state, save_iters, save_path):
     metadata = {"logs": state.tracker.history, "use_gan": state.use_gan}
+    if getattr(state, "launch_id", None) is not None:
+        metadata["launch_id"] = state.launch_id
 
     tags = ["latest"]
     state.tracker.print(f"Saving to {str(Path('.').absolute())}")
-    if state.tracker.is_best("val", "mel/loss"):
+    if state.tracker.is_best("val", "loss"): # no longer mel/loss (CW).
         state.tracker.print(f"Best generator so far")
         tags.append("best")
     if state.tracker.step in save_iters:
@@ -628,15 +637,33 @@ def save_samples(state, val_idx, writer, wandb=None, wandb_run=None,
         wandb_run.log(plots)
 
 
-def codebook_usage_metrics(counts):
-    """Compute per-book metrics from full-pass assignment counts (fractions 0–1)."""
+@torch.no_grad()
+def accumulate_codebook_counts(counts, codes, active_mask=None):
+    """Accumulate assignments; dropout-inactive stages must not contribute."""
+    codes = codes.detach()
+    for q in range(codes.shape[1]):
+        selected = codes[:, q, :]
+        if active_mask is not None:
+            selected = selected[active_mask[:, q]]
+        counts[q].add_(torch.bincount(selected.reshape(-1), minlength=counts.shape[1]))
+
+
+def reduce_codebook_counts(counts):
+    """Sum histograms across ranks before calculating usage statistics."""
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.SUM)
+
+
+def codebook_usage_metrics(counts, split="val"):
+    """Compute usage metrics and sample budgets from aggregated assignments."""
     metrics = {}
     for q, row in enumerate(counts.double()):
         total = row.sum().item()
         used = (row > 0).sum().item()
         p = row[row > 0] / total if total else row[:0]
-        prefix = f"val/codebook_{q}"
+        prefix = f"{split}/codebook_{q}"
         metrics.update({
+            f"{prefix}/assignments": int(total),
             f"{prefix}/utilization": used / row.numel(),
             f"{prefix}/perplexity": (-(p * p.log()).sum()).exp().item() if total else 0.0,
             f"{prefix}/dominant_fraction": row.max().item() / total if total else 0.0,
@@ -644,19 +671,20 @@ def codebook_usage_metrics(counts):
     return metrics
 
 
-def log_codebook_usage(counts, step, save_path, writer=None, wandb=None, wandb_run=None):
-    """Log validation curves and a per-checkpoint overview, also saved locally."""
+def log_codebook_usage(counts, step, save_path, writer=None, wandb=None, wandb_run=None,
+                       split="val"):
+    """Log usage over a validation pass or recent training interval."""
     from matplotlib.figure import Figure
 
     counts = counts.detach().cpu()
-    metrics = codebook_usage_metrics(counts)
+    metrics = codebook_usage_metrics(counts, split)
     figure = Figure(figsize=(12, 7), layout="constrained")
     axes = figure.subplots(2, 3, gridspec_kw={"height_ratios": [1, 1.3]})
     books = list(range(counts.shape[0]))
     for ax, metric, title in zip(axes[0],
             ("utilization", "perplexity", "dominant_fraction"),
             ("Utilization (fraction)", "Perplexity", "Dominant-code fraction")):
-        ax.bar(books, [metrics[f"val/codebook_{q}/{metric}"] for q in books])
+        ax.bar(books, [metrics[f"{split}/codebook_{q}/{metric}"] for q in books])
         ax.set(title=title, xlabel="Codebook", xticks=books,
                ylim=(0, counts.shape[1] if metric == "perplexity" else 1))
     for ax in axes[1]:
@@ -665,24 +693,27 @@ def log_codebook_usage(counts, step, save_path, writer=None, wandb=None, wandb_r
     probabilities = counts.float() / counts.sum(dim=1, keepdim=True).clamp_min(1)
     mesh = ax.imshow(probabilities.numpy(), aspect="auto", origin="lower",
                      interpolation="nearest", vmin=0)
-    ax.set(title="Assignment frequency across the full validation pass",
+    scope = "full validation pass" if split == "val" else "training interval since last log"
+    ax.set(title=f"Assignment frequency across the {scope}",
            xlabel="Code ID", ylabel="Codebook", yticks=books)
     figure.colorbar(mesh, ax=ax, label="Fraction of assignments")
-    figure.suptitle(f"Codebook usage · {step + 1} completed updates")
+    figure.suptitle(f"{split.capitalize()} codebook usage · {step + 1} completed updates")
     output = Path(save_path) / "plots" / f"step_{step + 1:06d}"
     output.mkdir(parents=True, exist_ok=True)
     try:
-        path = output / "codebook_usage.png"
+        # Preserve existing validation filenames; training gets its own files.
+        prefix = "" if split == "val" else f"{split}_"
+        path = output / f"{prefix}codebook_usage.png"
         figure.savefig(path, dpi=160)
         # Retain exact counts so metrics can be recomputed without inference.
-        torch.save(counts, output / "codebook_counts.pt")
+        torch.save(counts, output / f"{prefix}codebook_counts.pt")
         if writer is not None:
             for key, value in metrics.items():
                 writer.add_scalar(key, value, step)
-            writer.add_figure("val/codebook_usage", figure, global_step=step, close=False)
+            writer.add_figure(f"{split}/codebook_usage", figure, global_step=step, close=False)
         if wandb_run is not None:
             wandb_run.log({"training_step": step, **metrics,
-                           "val/codebook_usage": wandb.Image(str(path))})
+                           f"{split}/codebook_usage": wandb.Image(str(path))})
     finally:
         figure.clear()
 
@@ -696,8 +727,7 @@ def validate(state, val_dataloader, accel):
     for batch in val_dataloader:
         output = val_loop(batch, state, accel, codebook_counts=counts)
     # Sum raw counts, never per-batch or per-rank utilization/perplexity.
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.SUM)
+    reduce_codebook_counts(counts)
     output["codebook_counts"] = counts.cpu()
     # Print one compact table after aggregation, using Tracker's console so it
     # coexists with the live progress display and is also written to log.txt.
@@ -762,7 +792,12 @@ def train(
     )
     # Save/log the derived value rather than load()'s compatibility default.
     args["use_gan"] = use_gan
+    is_primary = int(os.environ.get("RANK", accel.local_rank)) == 0
+    launch = save_run_configuration(args, Path(save_path)) if is_primary else None
     state = load(args, accel, tracker, save_path, use_gan=use_gan)
+    if launch is not None:
+        state.launch_id = launch.name
+        tracker.print(f"Launch provenance: {launch}")
     train_dataloader = accel.prepare_dataloader(
         state.train_data,
         start_idx=state.tracker.step * batch_size,
@@ -794,14 +829,13 @@ def train(
     checkpoint = when(lambda: accel.local_rank == 0)(checkpoint)
 
     wandb_config = WandB()
-    # Use the global rank so multi-process launches create only one W&B run.
-    is_primary = int(os.environ.get("RANK", accel.local_rank)) == 0
     with ExitStack() as stack:
         if writer is not None:
             stack.callback(writer.close)
         wandb, wandb_run = None, None
         if is_primary:
-            save_run_configuration(args, Path(save_path))
+            # Record values actually consumed by argbind after initialization too.
+            argbind.dump_args(dict(argbind.get_used_args()), launch / "config_used.yml")
             wandb, wandb_run = initialize_wandb(
                 wandb_config, args, Path(save_path), accel.unwrap(state.generator)
             )
@@ -809,13 +843,20 @@ def train(
                 stack.enter_context(managed_wandb_run(
                     wandb, wandb_run, wandb_config["interrupt_timeout"]
                 ))
+                link_wandb_launch(launch, wandb_run)
                 if writer is not None:
                     # Flush TensorBoard before a possible forced W&B exit.
                     stack.callback(writer.flush)
 
+        # Reset on each log (and on resume): these are recent, not lifetime counts.
+        model = accel.unwrap(state.generator)
+        train_codebook_counts = torch.zeros(
+            model.n_codebooks, model.codebook_size, dtype=torch.long, device=accel.device
+        )
         with tracker.live:
             for tracker.step, batch in enumerate(train_dataloader, start=tracker.step):
-                output = train_loop(state, batch, accel, lambdas)
+                output = train_loop(state, batch, accel, lambdas,
+                                    codebook_counts=train_codebook_counts)
 
                 last_iter = (
                     tracker.step == num_iters - 1 if num_iters is not None else False
@@ -836,6 +877,13 @@ def train(
                     )
 
                 if tracker.step % valid_freq == 0 or last_iter:
+                    reduce_codebook_counts(train_codebook_counts)
+                    if is_primary:
+                        log_codebook_usage(
+                            train_codebook_counts, tracker.step, save_path,
+                            writer, wandb, wandb_run, split="train",
+                        )
+                    train_codebook_counts.zero_()
                     validation_output = validate(state, val_dataloader, accel)
                     if is_primary:
                         log_codebook_usage(
