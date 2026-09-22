@@ -2,7 +2,7 @@
 
 Run on the reserved physical GPU XXX ::
     CUDA_VISIBLE_DEVICES=3 python scripts/train_cw.py --args.load conf/base_cw_audio.yml
-    CUDA_VISIBLE_DEVICES=3 python scripts/train_cw.py --args.load conf/base_cw_eeg.yml
+    CUDA_VISIBLE_DEVICES=5 python scripts/train_cw.py --args.load conf/base_cw_eeg.yml
 """
 
 import os

@@ -178,6 +178,7 @@ class MultiScaleSTFTLoss(nn.Module):
         clamp_eps: float = 1e-5,
         mag_weight: float = 1.0,
         log_weight: float = 1.0,
+        phase_weight: float = 0.0,
         pow: float = 2.0,
         weight: float = 1.0,
         match_stride: bool = False,
@@ -196,6 +197,7 @@ class MultiScaleSTFTLoss(nn.Module):
         self.loss_fn = loss_fn
         self.log_weight = log_weight
         self.mag_weight = mag_weight
+        self.phase_weight = phase_weight
         self.clamp_eps = clamp_eps
         self.weight = weight
         self.pow = pow
@@ -220,11 +222,18 @@ class MultiScaleSTFTLoss(nn.Module):
         for s in self.stft_params:
             x.stft(s.window_length, s.hop_length, s.window_type)
             y.stft(s.window_length, s.hop_length, s.window_type)
+
             loss += self.log_weight * self.loss_fn(
                 x.magnitude.clamp(self.clamp_eps).pow(self.pow).log10(),
                 y.magnitude.clamp(self.clamp_eps).pow(self.pow).log10(),
             )
             loss += self.mag_weight * self.loss_fn(x.magnitude, y.magnitude)
+            if self.phase_weight != 0:
+                phase_difference = x.phase - y.phase
+                phase_loss = (1.0 - torch.cos(phase_difference)).mean()
+                loss += self.phase_weight * phase_loss
+
+
         return loss
 
 
