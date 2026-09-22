@@ -2,7 +2,7 @@
 
 Run on the reserved physical GPU XXX ::
     CUDA_VISIBLE_DEVICES=3 python scripts/train_cw.py --args.load conf/base_cw_audio.yml
-    CUDA_VISIBLE_DEVICES=5 python scripts/train_cw.py --args.load conf/base_cw_eeg.yml
+    CUDA_VISIBLE_DEVICES=7 python scripts/train_cw.py --args.load conf/base_cw_eeg.yml
 """
 
 import os
@@ -421,11 +421,14 @@ def val_loop(batch, state, accel, codebook_counts=None):
     if codebook_counts is not None:
         accumulate_codebook_counts(codebook_counts, out["codes"])
 
+    stft_loss, stft_components = state.stft_loss(recons, signal, return_components=True)
+    waveform_loss = state.waveform_loss(recons, signal)
     return {
-        "loss": state.waveform_loss(recons, signal) + state.stft_loss(recons, signal),
+        "loss": waveform_loss + stft_loss,
         "mel/loss": state.mel_loss(recons, signal),
-        "stft/loss": state.stft_loss(recons, signal),
-        "waveform/loss": state.waveform_loss(recons, signal),
+        "stft/loss": stft_loss,
+        **{f"stft/{name}_loss": value for name, value in stft_components.items()},
+        "waveform/loss": waveform_loss,
     }
 
 
@@ -452,7 +455,16 @@ def train_loop(state, batch, accel, lambdas, codebook_counts=None):
         codebook_loss = out["vq/codebook_loss"]
 
     if codebook_counts is not None:
-        accumulate_codebook_counts(codebook_counts, out["codes"], out["codebook_mask"])
+        batch_codebook_counts = torch.zeros_like(codebook_counts)
+    else:
+        model = accel.unwrap(state.generator)
+        batch_codebook_counts = torch.zeros(
+            model.n_codebooks, model.codebook_size, dtype=torch.long, device=out["codes"].device
+        )
+    accumulate_codebook_counts(batch_codebook_counts, out["codes"], out["codebook_mask"])
+    if codebook_counts is not None:
+        # Keep interval counts local: they are reduced separately at validation time.
+        codebook_counts.add_(batch_codebook_counts)
 
 
     if False:
@@ -474,7 +486,10 @@ def train_loop(state, batch, accel, lambdas, codebook_counts=None):
         state.scheduler_d.step()
 
     with accel.autocast():
-        output["stft/loss"] = state.stft_loss(recons, signal)
+        output["stft/loss"], stft_components = state.stft_loss(
+            recons, signal, return_components=True
+        )
+        output.update({f"stft/{name}_loss": value for name, value in stft_components.items()})
         output["mel/loss"] = state.mel_loss(recons, signal)
         output["waveform/loss"] = state.waveform_loss(recons, signal)
         if state.use_gan:
@@ -498,6 +513,9 @@ def train_loop(state, batch, accel, lambdas, codebook_counts=None):
 
     output["other/learning_rate"] = state.optimizer_g.param_groups[0]["lr"]
     output["other/batch_size"] = signal.batch_size * accel.world_size
+    # Pool assignments across ranks, rather than averaging nonlinear usage scores.
+    reduce_codebook_counts(batch_codebook_counts)
+    output["codebook_usage_score"] = codebook_usage_score(batch_codebook_counts)
 
     return {k: v for k, v in sorted(output.items())}
 
@@ -654,6 +672,18 @@ def reduce_codebook_counts(counts):
         torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.SUM)
 
 
+@torch.no_grad()
+def codebook_usage_score(counts):
+    """Geometric mean of per-layer perplexity / size; NaN if a layer is unobserved."""
+    counts = counts.float()
+    totals = counts.sum(dim=1, keepdim=True)
+    probabilities = counts / totals.clamp_min(1)
+    # Zero-probability entries contribute zero entropy without evaluating log(0).
+    entropy = -(probabilities * probabilities.clamp_min(torch.finfo(counts.dtype).tiny).log()).sum(dim=1)
+    score = (entropy.mean() - math.log(counts.shape[1])).exp().clamp(max=1)
+    return torch.where((totals > 0).all(), score, score.new_full((), float("nan")))
+
+
 def codebook_usage_metrics(counts, split="val"):
     """Compute usage metrics and sample budgets from aggregated assignments."""
     metrics = {}
@@ -674,10 +704,14 @@ def codebook_usage_metrics(counts, split="val"):
 def log_codebook_usage(counts, step, save_path, writer=None, wandb=None, wandb_run=None,
                        split="val"):
     """Log usage over a validation pass or recent training interval."""
+    from matplotlib.colors import LogNorm
     from matplotlib.figure import Figure
 
     counts = counts.detach().cpu()
     metrics = codebook_usage_metrics(counts, split)
+    if split == "val":
+        # Training logs this name per batch; do not overwrite it with interval usage.
+        metrics["val/codebook_usage_score"] = codebook_usage_score(counts).item()
     figure = Figure(figsize=(12, 7), layout="constrained")
     axes = figure.subplots(2, 3, gridspec_kw={"height_ratios": [1, 1.3]})
     books = list(range(counts.shape[0]))
@@ -687,12 +721,18 @@ def log_codebook_usage(counts, step, save_path, writer=None, wandb=None, wandb_r
         ax.bar(books, [metrics[f"{split}/codebook_{q}/{metric}"] for q in books])
         ax.set(title=title, xlabel="Codebook", xticks=books,
                ylim=(0, counts.shape[1] if metric == "perplexity" else 1))
+        if metric == "dominant_fraction":
+            ax.set_ylim(0.5 / counts.shape[1], 1)
+            ax.set_yscale("log")
     for ax in axes[1]:
         ax.remove()
     ax = figure.add_subplot(figure.axes[0].get_subplotspec().get_gridspec()[1, :])
     probabilities = counts.float() / counts.sum(dim=1, keepdim=True).clamp_min(1)
+    positive = probabilities[probabilities > 0]
+    # LogNorm masks unused codes; keep valid limits even for empty or one-hot counts.
+    vmin = min(positive.min().item(), 0.1) if positive.numel() else 0.1
     mesh = ax.imshow(probabilities.numpy(), aspect="auto", origin="lower",
-                     interpolation="nearest", vmin=0)
+                     interpolation="nearest", norm=LogNorm(vmin=vmin, vmax=1))
     scope = "full validation pass" if split == "val" else "training interval since last log"
     ax.set(title=f"Assignment frequency across the {scope}",
            xlabel="Code ID", ylabel="Codebook", yticks=books)

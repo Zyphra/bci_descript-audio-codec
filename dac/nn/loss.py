@@ -202,7 +202,7 @@ class MultiScaleSTFTLoss(nn.Module):
         self.weight = weight
         self.pow = pow
 
-    def forward(self, x: AudioSignal, y: AudioSignal):
+    def forward(self, x: AudioSignal, y: AudioSignal, return_components: bool = False):
         """Computes multi-scale STFT between an estimate and a reference
         signal.
 
@@ -212,29 +212,39 @@ class MultiScaleSTFTLoss(nn.Module):
             Estimate signal
         y : AudioSignal
             Reference signal
+        return_components : bool, optional
+            Also return unweighted magnitude, log-magnitude, and phase losses,
+            summed across STFT scales, including components with zero weights.
 
         Returns
         -------
-        torch.Tensor
-            Multi-scale STFT loss.
+        torch.Tensor or tuple[torch.Tensor, dict]
+            Weighted multi-scale STFT loss, optionally paired with a dictionary
+            containing ``mag``, ``log_mag``, and ``phase`` tensors.
         """
         loss = 0.0
+        components = {"mag": 0.0, "log_mag": 0.0, "phase": 0.0}
         for s in self.stft_params:
             x.stft(s.window_length, s.hop_length, s.window_type)
             y.stft(s.window_length, s.hop_length, s.window_type)
 
-            loss += self.log_weight * self.loss_fn(
+            log_mag_loss = self.loss_fn(
                 x.magnitude.clamp(self.clamp_eps).pow(self.pow).log10(),
                 y.magnitude.clamp(self.clamp_eps).pow(self.pow).log10(),
             )
-            loss += self.mag_weight * self.loss_fn(x.magnitude, y.magnitude)
-            if self.phase_weight != 0:
+            mag_loss = self.loss_fn(x.magnitude, y.magnitude)
+            components["log_mag"] += log_mag_loss
+            components["mag"] += mag_loss
+            loss += self.log_weight * log_mag_loss
+            loss += self.mag_weight * mag_loss
+            if return_components or self.phase_weight != 0:
                 phase_difference = x.phase - y.phase
                 phase_loss = (1.0 - torch.cos(phase_difference)).mean()
-                loss += self.phase_weight * phase_loss
+                components["phase"] += phase_loss
+                if self.phase_weight != 0:
+                    loss += self.phase_weight * phase_loss
 
-
-        return loss
+        return (loss, components) if return_components else loss
 
 
 class MelSpectrogramLoss(nn.Module):

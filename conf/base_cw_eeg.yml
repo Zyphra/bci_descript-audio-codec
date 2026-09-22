@@ -41,7 +41,7 @@ seed: 0
 lambdas:
   mel/loss: 0.0 # 15.0
   stft/loss: 15.0 #0.0     # default to 0.0, not in DAC for audio
-  waveform/loss: 0.0 #15.0 #0.0 # default to 0.0, not in DAC for audio
+  waveform/loss: 0.0 # 15.0 #0.0 # default to 0.0, not in DAC for audio
   adv/feat_loss: 0.0 # 2.0
   adv/gen_loss: 0.0 # 1.0
   vq/commitment_loss: 0.25
@@ -63,7 +63,7 @@ build_transform.postprocess: # after augmentation
 
 # Loss setup
 MultiScaleSTFTLoss.window_lengths: [256, 64]                  # EEG: was [2048, 512]
-MultiScaleSTFTLoss.mag_weight: 1.0 # default to 1.0
+MultiScaleSTFTLoss.mag_weight: 0.0 # default to 1.0
 MultiScaleSTFTLoss.log_weight: 1.0 # default to 1.0
 MultiScaleSTFTLoss.phase_weight: 1.0 # default to 0.0
 
@@ -110,12 +110,12 @@ val/build_dataset.folders:
 # Experiment tracking using tensorboard and/or wandb
 # =============================================================================
 
-save_path: runs/dac-eeg_alice_cw_13
+save_path: runs/dac-eeg_alice_cw_15
 
 WandB.enabled: true
 WandB.project: dac-eeg-cw
 WandB.entity: ""
-WandB.name: eeg_alice_cw_13
+WandB.name: eeg_alice_cw_15
 WandB.group: alice
 WandB.tags: [eeg, dac]
 WandB.mode: online
