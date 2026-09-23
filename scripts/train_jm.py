@@ -1,8 +1,8 @@
 """
 # Run this script with: 
 
+CUDA_VISIBLE_DEVICES=1 python scripts/train_jm.py --args.load conf/base_jm_eeg.yml
 CUDA_VISIBLE_DEVICES=4 python scripts/train_jm.py --args.load conf/base_jm_eeg.yml
-
 
 
 CUDA_VISIBLE_DEVICES=4 python scripts/train_jm.py \
@@ -55,12 +55,16 @@ CUDA_VISIBLE_DEVICES=5 python scripts/train_jm.py \
 """
 
 import os
+import math
 import shutil
-from contextlib import ExitStack
+import signal
+import threading
+from contextlib import ExitStack, contextmanager
 import sys
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 import argbind
 import torch
@@ -86,6 +90,7 @@ def WandB(
     project: str = "eeg-dac",
     entity: str = "",
     name: str = "eeg-alice",
+    notes: str = "",
     group: str = "",
     tags: list = ["eeg", "dac"],
     mode: str = "online",
@@ -93,16 +98,20 @@ def WandB(
     log_reconstruction: bool = True,
     stft_window_length: int = 256,
     watch_model: bool = False,
+    interrupt_timeout: float = 30.0,
 ) -> dict:
     if log_freq < 1:
         raise ValueError("WandB.log_freq must be at least 1")
     if stft_window_length < 4:
         raise ValueError("WandB.stft_window_length must be at least 4")
+    if not math.isfinite(interrupt_timeout) or interrupt_timeout <= 0:
+        raise ValueError("WandB.interrupt_timeout must be finite and positive")
     return {
         "enabled": enabled,
         "project": project,
         "entity": entity,
         "name": name,
+        "notes": notes,
         "group": group,
         "tags": tags,
         "mode": mode,
@@ -110,6 +119,7 @@ def WandB(
         "log_reconstruction": log_reconstruction,
         "stft_window_length": stft_window_length,
         "watch_model": watch_model,
+        "interrupt_timeout": interrupt_timeout,
     }
 
 
@@ -144,6 +154,7 @@ def initialize_wandb(config: dict, args, output: Path, model: torch.nn.Module):
     init_kwargs = {
         "project": config["project"],
         "name": config["name"],
+        "notes": config["notes"],
         "tags": config["tags"],
         "mode": config["mode"],
         "dir": str(output),
@@ -171,6 +182,65 @@ def initialize_wandb(config: dict, args, output: Path, model: torch.nn.Module):
     if config["watch_model"]:
         wandb.watch(model, log="gradients", log_freq=config["log_freq"])
     return wandb, run
+
+
+def finish_interrupted_wandb(wandb, run, timeout):
+    """Bound both run finalization and service teardown on older W&B SDKs.
+
+    A hard exit is reserved for an already interrupted process: raising from
+    finish alone can leave W&B's atexit hook waiting on the same stuck service.
+    """
+    run_dir = str(Path(run.dir).parent)
+    recovery = f"Local W&B data: {run_dir}\nRecover with: wandb sync {run_dir}\n"
+
+    def force_exit(reason):
+        try:
+            os.write(2, (f"\n{reason}; exiting with code 130.\n" + recovery).encode())
+        finally:
+            os._exit(130)
+
+    previous_handler = signal.signal(
+        signal.SIGINT, lambda *_: force_exit("Second Ctrl-C during W&B shutdown")
+    )
+    watchdog = threading.Timer(
+        timeout, force_exit, args=(f"W&B shutdown exceeded {timeout:g} seconds",)
+    )
+    watchdog.daemon = True
+    watchdog.start()
+    try:
+        print(
+            f"\nTraining interrupted. Allowing W&B {timeout:g} seconds to sync; "
+            "press Ctrl-C again to exit immediately.\n" + recovery,
+            file=sys.stderr, flush=True,
+        )
+        run.finish(exit_code=130)
+        # Include service shutdown in the deadline, rather than leaving it to
+        # an unbounded atexit callback after run.finish() returns.
+        wandb.teardown(exit_code=130)
+    except BaseException:
+        force_exit("W&B interrupted-run cleanup failed")
+    finally:
+        watchdog.cancel()
+        signal.signal(signal.SIGINT, previous_handler)
+
+
+@contextmanager
+def managed_wandb_run(wandb, run, interrupt_timeout):
+    try:
+        yield run
+    except KeyboardInterrupt:
+        finish_interrupted_wandb(wandb, run, interrupt_timeout)
+        raise
+    except BaseException:
+        run.finish(exit_code=1)
+        raise
+    else:
+        try:
+            run.finish(exit_code=0)
+        except KeyboardInterrupt:
+            # Ctrl-C may arrive during final upload after training completes.
+            finish_interrupted_wandb(wandb, run, interrupt_timeout)
+            raise
 
 
 def save_run_configuration(args, output: Path) -> None:
@@ -270,13 +340,14 @@ class State:
     optimizer_g: AdamW
     scheduler_g: ExponentialLR
 
-    discriminator: Discriminator
-    optimizer_d: AdamW
-    scheduler_d: ExponentialLR
+    use_gan: bool
+    discriminator: Optional[Discriminator]
+    optimizer_d: Optional[AdamW]
+    scheduler_d: Optional[ExponentialLR]
 
     stft_loss: losses.MultiScaleSTFTLoss
     mel_loss: losses.MelSpectrogramLoss
-    gan_loss: losses.GANLoss
+    gan_loss: Optional[losses.GANLoss]
     waveform_loss: losses.L1Loss
 
     train_data: AudioDataset
@@ -294,6 +365,7 @@ def load(
     resume: bool = False,
     tag: str = "latest",
     load_weights: bool = False,
+    use_gan: bool = True,
 ):
     generator, g_extra = None, {}
     discriminator, d_extra = None, {}
@@ -307,24 +379,32 @@ def load(
         tracker.print(f"Resuming from {str(Path('.').absolute())}/{kwargs['folder']}")
         if (Path(kwargs["folder"]) / "dac").exists():
             generator, g_extra = DAC.load_from_folder(**kwargs)
-        if (Path(kwargs["folder"]) / "discriminator").exists():
+        # A reused output folder may still contain an older discriminator.
+        checkpoint_used_gan = getattr(generator, "metadata", {}).get("use_gan", True)
+        if use_gan and checkpoint_used_gan and (Path(kwargs["folder"]) / "discriminator").exists():
             discriminator, d_extra = Discriminator.load_from_folder(**kwargs)
 
     generator = DAC() if generator is None else generator
-    discriminator = Discriminator() if discriminator is None else discriminator
+    if use_gan:
+        discriminator = Discriminator() if discriminator is None else discriminator
 
     tracker.print(generator)
-    tracker.print(discriminator)
+    tracker.print(f"GAN training: {'enabled' if use_gan else 'disabled (both adversarial weights are zero)'}")
+    if use_gan:
+        tracker.print(discriminator)
 
     generator = accel.prepare_model(generator)
-    discriminator = accel.prepare_model(discriminator)
+    if use_gan:
+        discriminator = accel.prepare_model(discriminator)
 
     with argbind.scope(args, "generator"):
         optimizer_g = AdamW(generator.parameters(), use_zero=accel.use_ddp)
         scheduler_g = ExponentialLR(optimizer_g)
-    with argbind.scope(args, "discriminator"):
-        optimizer_d = AdamW(discriminator.parameters(), use_zero=accel.use_ddp)
-        scheduler_d = ExponentialLR(optimizer_d)
+    optimizer_d, scheduler_d = None, None
+    if use_gan:
+        with argbind.scope(args, "discriminator"):
+            optimizer_d = AdamW(discriminator.parameters(), use_zero=accel.use_ddp)
+            scheduler_d = ExponentialLR(optimizer_d)
 
     if "optimizer.pth" in g_extra:
         optimizer_g.load_state_dict(g_extra["optimizer.pth"])
@@ -347,9 +427,10 @@ def load(
     waveform_loss = losses.L1Loss()
     stft_loss = losses.MultiScaleSTFTLoss()
     mel_loss = losses.MelSpectrogramLoss()
-    gan_loss = losses.GANLoss(discriminator)
+    gan_loss = losses.GANLoss(discriminator) if use_gan else None
 
     return State(
+        use_gan=use_gan,
         generator=generator,
         optimizer_g=optimizer_g,
         scheduler_g=scheduler_g,
@@ -368,7 +449,7 @@ def load(
 
 @timer()
 @torch.no_grad()
-def val_loop(batch, state, accel):
+def val_loop(batch, state, accel, codebook_counts=None):
     state.generator.eval()
     batch = util.prepare_batch(batch, accel.device)
     signal = state.val_data.transform(
@@ -377,6 +458,13 @@ def val_loop(batch, state, accel):
 
     out = state.generator(signal.audio_data, signal.sample_rate)
     recons = AudioSignal(out["audio"], signal.sample_rate)
+
+    if codebook_counts is not None:
+        codes = out["codes"].detach()
+        for q in range(codes.shape[1]):
+            codebook_counts[q].add_(torch.bincount(
+                codes[:, q, :].reshape(-1), minlength=codebook_counts.shape[1]
+            ))
 
     return {
         "loss": state.mel_loss(recons, signal),
@@ -389,7 +477,8 @@ def val_loop(batch, state, accel):
 @timer()
 def train_loop(state, batch, accel, lambdas):
     state.generator.train()
-    state.discriminator.train()
+    if state.use_gan:
+        state.discriminator.train()
     output = {}
 
     batch = util.prepare_batch(batch, accel.device)
@@ -453,26 +542,28 @@ def train_loop(state, batch, accel, lambdas):
         commitment_loss = out["vq/commitment_loss"]
         codebook_loss = out["vq/codebook_loss"]
 
-    with accel.autocast():
-        output["adv/disc_loss"] = state.gan_loss.discriminator_loss(recons, signal)
+    if state.use_gan:
+        with accel.autocast():
+            output["adv/disc_loss"] = state.gan_loss.discriminator_loss(recons, signal)
 
-    state.optimizer_d.zero_grad()
-    accel.backward(output["adv/disc_loss"])
-    accel.scaler.unscale_(state.optimizer_d)
-    output["other/grad_norm_d"] = torch.nn.utils.clip_grad_norm_(
-        state.discriminator.parameters(), 10.0
-    )
-    accel.step(state.optimizer_d)
-    state.scheduler_d.step()
+        state.optimizer_d.zero_grad()
+        accel.backward(output["adv/disc_loss"])
+        accel.scaler.unscale_(state.optimizer_d)
+        output["other/grad_norm_d"] = torch.nn.utils.clip_grad_norm_(
+            state.discriminator.parameters(), 10.0
+        )
+        accel.step(state.optimizer_d)
+        state.scheduler_d.step()
 
     with accel.autocast():
         output["stft/loss"] = state.stft_loss(recons, signal)
         output["mel/loss"] = state.mel_loss(recons, signal)
         output["waveform/loss"] = state.waveform_loss(recons, signal)
-        (
-            output["adv/gen_loss"],
-            output["adv/feat_loss"],
-        ) = state.gan_loss.generator_loss(recons, signal)
+        if state.use_gan:
+            (
+                output["adv/gen_loss"],
+                output["adv/feat_loss"],
+            ) = state.gan_loss.generator_loss(recons, signal)
         output["vq/commitment_loss"] = commitment_loss
         output["vq/codebook_loss"] = codebook_loss
         output["loss"] = sum([v * output[k] for k, v in lambdas.items() if k in output])
@@ -494,7 +585,7 @@ def train_loop(state, batch, accel, lambdas):
 
 
 def checkpoint(state, save_iters, save_path):
-    metadata = {"logs": state.tracker.history}
+    metadata = {"logs": state.tracker.history, "use_gan": state.use_gan}
 
     tags = ["latest"]
     state.tracker.print(f"Saving to {str(Path('.').absolute())}")
@@ -515,13 +606,14 @@ def checkpoint(state, save_iters, save_path):
         accel.unwrap(state.generator).save_to_folder(
             f"{save_path}/{tag}", generator_extra
         )
-        discriminator_extra = {
-            "optimizer.pth": state.optimizer_d.state_dict(),
-            "scheduler.pth": state.scheduler_d.state_dict(),
-        }
-        accel.unwrap(state.discriminator).save_to_folder(
-            f"{save_path}/{tag}", discriminator_extra
-        )
+        if state.use_gan:
+            discriminator_extra = {
+                "optimizer.pth": state.optimizer_d.state_dict(),
+                "scheduler.pth": state.scheduler_d.state_dict(),
+            }
+            accel.unwrap(state.discriminator).save_to_folder(
+                f"{save_path}/{tag}", discriminator_extra
+            )
 
 
 def reconstruction_figures(target, reconstruction, sample_rate, window_length, title):
@@ -625,12 +717,99 @@ def save_samples(state, val_idx, writer, wandb=None, wandb_run=None,
         wandb_run.log(plots)
 
 
+def codebook_usage_metrics(counts):
+    """Compute per-book metrics from full-pass assignment counts (fractions 0–1)."""
+    metrics = {}
+    for q, row in enumerate(counts.double()):
+        total = row.sum().item()
+        used = (row > 0).sum().item()
+        p = row[row > 0] / total if total else row[:0]
+        prefix = f"val/codebook_{q}"
+        metrics.update({
+            f"{prefix}/utilization": used / row.numel(),
+            f"{prefix}/perplexity": (-(p * p.log()).sum()).exp().item() if total else 0.0,
+            f"{prefix}/dominant_fraction": row.max().item() / total if total else 0.0,
+        })
+    return metrics
+
+
+def log_codebook_usage(counts, step, save_path, writer=None, wandb=None, wandb_run=None):
+    """Log validation curves and a per-checkpoint overview, also saved locally."""
+    from matplotlib.figure import Figure
+
+    counts = counts.detach().cpu()
+    metrics = codebook_usage_metrics(counts)
+    figure = Figure(figsize=(12, 7), layout="constrained")
+    axes = figure.subplots(2, 3, gridspec_kw={"height_ratios": [1, 1.3]})
+    books = list(range(counts.shape[0]))
+    for ax, metric, title in zip(axes[0],
+            ("utilization", "perplexity", "dominant_fraction"),
+            ("Utilization (fraction)", "Perplexity", "Dominant-code fraction")):
+        ax.bar(books, [metrics[f"val/codebook_{q}/{metric}"] for q in books])
+        ax.set(title=title, xlabel="Codebook", xticks=books,
+               ylim=(0, counts.shape[1] if metric == "perplexity" else 1))
+    for ax in axes[1]:
+        ax.remove()
+    ax = figure.add_subplot(figure.axes[0].get_subplotspec().get_gridspec()[1, :])
+    probabilities = counts.float() / counts.sum(dim=1, keepdim=True).clamp_min(1)
+    mesh = ax.imshow(probabilities.numpy(), aspect="auto", origin="lower",
+                     interpolation="nearest", vmin=0)
+    ax.set(title="Assignment frequency across the full validation pass",
+           xlabel="Code ID", ylabel="Codebook", yticks=books)
+    figure.colorbar(mesh, ax=ax, label="Fraction of assignments")
+    figure.suptitle(f"Codebook usage · {step + 1} completed updates")
+    output = Path(save_path) / "plots" / f"step_{step + 1:06d}"
+    output.mkdir(parents=True, exist_ok=True)
+    try:
+        path = output / "codebook_usage.png"
+        figure.savefig(path, dpi=160)
+        # Retain exact counts so metrics can be recomputed without inference.
+        torch.save(counts, output / "codebook_counts.pt")
+        if writer is not None:
+            for key, value in metrics.items():
+                writer.add_scalar(key, value, step)
+            writer.add_figure("val/codebook_usage", figure, global_step=step, close=False)
+        if wandb_run is not None:
+            wandb_run.log({"training_step": step, **metrics,
+                           "val/codebook_usage": wandb.Image(str(path))})
+    finally:
+        figure.clear()
+
+
 def validate(state, val_dataloader, accel):
+    model = accel.unwrap(state.generator)
+    counts = torch.zeros(
+        model.n_codebooks, model.codebook_size, dtype=torch.long, device=accel.device
+    )
+    output = {}
     for batch in val_dataloader:
-        output = val_loop(batch, state, accel)
+        output = val_loop(batch, state, accel, codebook_counts=counts)
+    # Sum raw counts, never per-batch or per-rank utilization/perplexity.
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.SUM)
+    output["codebook_counts"] = counts.cpu()
+    # Print one compact table after aggregation, using Tracker's console so it
+    # coexists with the live progress display and is also written to log.txt.
+    if state.tracker.rank == 0:
+        from rich.table import Table
+
+        metrics = codebook_usage_metrics(output["codebook_counts"])
+        table = Table(title="Validation codebook usage (full pass)")
+        for column in ("Book", "Utilization", "Perplexity", "Dominant code"):
+            table.add_column(column, justify="right")
+        for q in range(counts.shape[0]):
+            prefix = f"val/codebook_{q}"
+            table.add_row(
+                str(q),
+                f"{metrics[f'{prefix}/utilization']:.1%}",
+                f"{metrics[f'{prefix}/perplexity']:.1f}",
+                f"{metrics[f'{prefix}/dominant_fraction']:.1%}",
+            )
+        state.tracker.print(table)
     # Consolidate state dicts if using ZeroRedundancyOptimizer
     if hasattr(state.optimizer_g, "consolidate_state_dict"):
         state.optimizer_g.consolidate_state_dict()
+    if state.optimizer_d is not None and hasattr(state.optimizer_d, "consolidate_state_dict"):
         state.optimizer_d.consolidate_state_dict()
     return output
 
@@ -666,7 +845,13 @@ def train(
         writer=writer, log_file=f"{save_path}/log.txt", rank=accel.local_rank
     )
 
-    state = load(args, accel, tracker, save_path)
+    use_gan = any(
+        lambdas.get(key, 0.0) != 0.0
+        for key in ("adv/gen_loss", "adv/feat_loss")
+    )
+    # Save/log the derived value rather than load()'s compatibility default.
+    args["use_gan"] = use_gan
+    state = load(args, accel, tracker, save_path, use_gan=use_gan)
     train_dataloader = accel.prepare_dataloader(
         state.train_data,
         start_idx=state.tracker.step * batch_size,
@@ -710,7 +895,12 @@ def train(
                 wandb_config, args, Path(save_path), accel.unwrap(state.generator)
             )
             if wandb_run is not None:
-                stack.enter_context(wandb_run)
+                stack.enter_context(managed_wandb_run(
+                    wandb, wandb_run, wandb_config["interrupt_timeout"]
+                ))
+                if writer is not None:
+                    # Flush TensorBoard before a possible forced W&B exit.
+                    stack.callback(writer.flush)
 
         with tracker.live:
             for tracker.step, batch in enumerate(train_dataloader, start=tracker.step):
@@ -735,7 +925,12 @@ def train(
                     )
 
                 if tracker.step % valid_freq == 0 or last_iter:
-                    validate(state, val_dataloader, accel)
+                    validation_output = validate(state, val_dataloader, accel)
+                    if is_primary:
+                        log_codebook_usage(
+                            validation_output["codebook_counts"], tracker.step,
+                            save_path, writer, wandb, wandb_run,
+                        )
                     if wandb_run is not None:
                         # Tracker stores the full validation pass means, whereas
                         # validate() returns only the final batch's output.

@@ -1,15 +1,15 @@
 # Model setup
 DAC.sample_rate: 256                 # EEG: was 44100
 DAC.encoder_dim: 64
-DAC.encoder_rates: [2, 2, 2, 2]      # EEG: was [2, 4, 8, 8]; hop 16 -> 16 tokens/s (audio: hop 512 -> 86 tokens/s)
+DAC.encoder_rates: [2, 2, 2, 4]      # EEG: was [2, 4, 8, 8]; hop 16 -> 16 tokens/s (audio: hop 512 -> 86 tokens/s)
 DAC.decoder_dim: 1536
-DAC.decoder_rates: [2, 2, 2, 2]      # EEG: was [8, 8, 4, 2]
+DAC.decoder_rates: [4, 2, 2, 2]      # EEG: was [8, 8, 4, 2]
 
 # Quantization
-DAC.n_codebooks: 9
-DAC.codebook_size: 1024
+DAC.n_codebooks: 5
+DAC.codebook_size: 1024 #1024
 DAC.codebook_dim: 8
-DAC.quantizer_dropout: 1.0
+DAC.quantizer_dropout: 0.0 # 1.0
 
 # Discriminator
 Discriminator.sample_rate: 256       # EEG: was 44100
@@ -29,9 +29,9 @@ AdamW.lr: 0.0001
 ExponentialLR.gamma: 0.999996
 
 amp: false
-val_batch_size: 24
+val_batch_size: 128 # 24 
 device: cuda
-num_iters: 10000 #250000
+num_iters: 20000 #250000
 save_iters: [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000] #[10000, 50000, 100000, 200000]
 valid_freq: 1000
 sample_freq: 1000 #10000
@@ -39,11 +39,11 @@ num_workers: 32
 val_idx: [0, 1, 2, 3, 4, 5, 6, 7]
 seed: 0
 lambdas:
-  mel/loss: 15.0
+  mel/loss: 0.0 # 15.0
   stft/loss: 15.0 # 0.0     # default to 0.0, not in DAC for audio
   waveform/loss: 15.0 #0.0 # default to 0.0, not in DAC for audio
-  adv/feat_loss: 0.0 # 2.0
-  adv/gen_loss: 0.0 # 1.0
+  adv/feat_loss:  2.0
+  adv/gen_loss: 1.0
   vq/commitment_loss: 0.25
   vq/codebook_loss: 1.0
 
@@ -180,9 +180,9 @@ build_transform.postprocess: # postprocessing that's ALWAYS applied to the audio
 # TimeMask.t_width: [uniform, 0.025, 0.25] #EEG: 2.5% to 25% of the signal
 # TimeMask.prob: 1.0
 
-  - MaskLowMagnitudes     # removes spectral components below a magnitude threshold
-MaskLowMagnitudes.db_cutoff: [uniform, -10, 10]
-MaskLowMagnitudes.prob: 1.0
+#   - MaskLowMagnitudes     # removes spectral components below a magnitude threshold
+# MaskLowMagnitudes.db_cutoff: [uniform, -10, 10]
+# MaskLowMagnitudes.prob: 1.0
 
   # - Smoothing              # smooths the waveform over a selected window
   # Smoothing.window_type: [const, average]
@@ -219,8 +219,8 @@ MelSpectrogramLoss.clamp_eps: 1.0e-5
 MelSpectrogramLoss.mag_weight: 0.0
 
 # Data
-batch_size: 72
-train/AudioDataset.duration: 5.0 #0.38 #0.38s at 256Hz = 96 samples, too short for the stft discriminator 
+batch_size: 128 #24
+train/AudioDataset.duration: 5.0     # EEG: was 0.38; 0.38 s = 97 samples crashes the MRD STFT padding
 train/AudioDataset.n_examples: 10000000
 
 val/AudioDataset.duration: 5.0
@@ -237,11 +237,11 @@ AudioDataset.without_replacement: true
 
 train/build_dataset.folders:         # EEG: was EARS
   alice:
-    - /data/groups/bci/datasets/alice/Alice/cache/prep2/train
+    - /data/groups/bci/datasets/processed/v8_sets/10k/train
 
 val/build_dataset.folders:
   alice:
-    - /data/groups/bci/datasets/alice/Alice/cache/prep2/val
+    - /data/groups/bci/datasets/processed/v8_sets/10k/val
 
 # test/build_dataset.folders:
 #   alice:
@@ -249,15 +249,16 @@ val/build_dataset.folders:
 
 
 # =============================================================================
-# Experiment tracking using tensorboard and/or wandb
+# Experiment tracking using tensorboard and/or wand0b
 # =============================================================================
 
-save_path: runs/dac-eeg_alice_jm_2
+save_path: runs/10k_5X1024
 
 WandB.enabled: true
 WandB.project: dac-eeg-jm
 WandB.entity: ""
-WandB.name: eeg_alice_jm_0
+WandB.name: "10k_5x1024"
+WandB.notes: ""
 WandB.group: alice
 WandB.tags: [eeg, dac]
 WandB.mode: online
