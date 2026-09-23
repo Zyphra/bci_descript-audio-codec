@@ -174,3 +174,10 @@ archived/
 encoded_out/
 recon/
 recons/
+
+# classifier-eval suite: track the code, exclude runtime artifacts
+scripts/eval/logs/*
+!scripts/eval/logs/.gitkeep
+scripts/eval/results/
+scripts/eval/.run.lock
+scripts/eval/__pycache__/
