@@ -7,6 +7,7 @@ Run on the reserved physical GPU XXX ::
 
 import os
 import math
+import json
 import shutil
 import signal
 import threading
@@ -116,8 +117,16 @@ def initialize_wandb(config: dict, args, output: Path, model: torch.nn.Module):
     run = wandb.init(**init_kwargs)
     # This trainer is iteration-based; validation uses the same step axis.
     run.define_metric("training_step")
-    for namespace in ("train/*", "val/*"):
+    for namespace in ("train/*", "val/*", "train_codebooks/*", "val_codebooks/*"):
         run.define_metric(namespace, step_metric="training_step")
+    # Keep summary values queryable without creating duplicate scalar panels.
+    for split in ("train", "val"):
+        for metric in ("utilization", "perplexity", "dominant_fraction"):
+            for statistic in ("mean", "sem"):
+                run.define_metric(f"{split}_codebooks/{metric}_{statistic}",
+                                  step_metric="training_step", hidden=True)
+        run.define_metric(f"{split}_codebooks/observed_layers",
+                          step_metric="training_step", hidden=True)
     run.define_metric("reconstruction_step")
     run.define_metric("reconstruction/*", step_metric="reconstruction_step", summary="none")
     run.config.update(
@@ -701,6 +710,67 @@ def codebook_usage_metrics(counts, split="val"):
     return metrics
 
 
+def codebook_layer_summary(counts, metrics, split):
+    """Equal-weight layer means and sample SEM, excluding unobserved layers."""
+    observed = (counts.sum(dim=1) > 0).nonzero().flatten().tolist()
+    summary = {"observed_layers": len(observed)}
+    for metric in ("utilization", "perplexity", "dominant_fraction"):
+        values = torch.tensor([metrics[f"{split}/codebook_{q}/{metric}"]
+                               for q in observed], dtype=torch.float64)
+        summary[f"{metric}_mean"] = values.mean().item() if observed else None
+        summary[f"{metric}_sem"] = (
+            (values.std(unbiased=True) / math.sqrt(len(observed))).item()
+            if len(observed) > 1 else None
+        )
+    return summary
+
+
+def update_codebook_summary_history(path, step, summary, shape):
+    """Persist histories across resume; replace repeated steps and discard future ones."""
+    shape = list(shape)
+    history = json.loads(path.read_text()) if path.exists() else {}
+    rows = history.get("rows", []) if history.get("shape") == shape else []
+    rows = [row for row in rows if row["step"] < step]
+    rows.append({"step": step, **summary})
+    history = {"shape": shape, "rows": rows}
+    path.write_text(json.dumps(history, allow_nan=False, indent=2) + "\n")
+    return history
+
+
+def codebook_summary_figures(history, split):
+    """Plot the full history of layer means with actual standard-error bars."""
+    from matplotlib.figure import Figure
+
+    figures = {}
+    size = history["shape"][1]
+    rows = history["rows"]
+    for metric, title in (("utilization", "Utilization"), ("perplexity", "Perplexity"),
+                          ("dominant_fraction", "Dominant-code fraction")):
+        figure = Figure(figsize=(7, 4), layout="constrained")
+        ax = figure.subplots()
+        means = [row[f"{metric}_mean"] for row in rows]
+        ax.plot([row["step"] for row in rows],
+                [value if value is not None else float("nan") for value in means],
+                marker="o", markersize=3, label="Layer mean", color="C0")
+        with_sem = [row for row in rows if row[f"{metric}_sem"] is not None]
+        if with_sem:
+            ax.errorbar([row["step"] for row in with_sem],
+                        [row[f"{metric}_mean"] for row in with_sem],
+                        yerr=[row[f"{metric}_sem"] for row in with_sem],
+                        fmt="none", ecolor="C0", capsize=3, label="±1 SEM across layers")
+        ax.set(title=f"{split.capitalize()} {title.lower()} · layer mean ± SEM",
+               xlabel="Training step", ylabel=title,
+               ylim=(0, size if metric == "perplexity" else 1))
+        if metric == "dominant_fraction":
+            ax.set_ylim(0.5 / size, 1)
+            ax.set_yscale("log")
+            ax.axhline(1 / size, color="gray", linestyle="--", label=f"Uniform: 1/{size}")
+        ax.grid(alpha=0.2)
+        ax.legend(fontsize="small")
+        figures[metric] = figure
+    return figures
+
+
 def log_codebook_usage(counts, step, save_path, writer=None, wandb=None, wandb_run=None,
                        split="val"):
     """Log usage over a validation pass or recent training interval."""
@@ -709,6 +779,7 @@ def log_codebook_usage(counts, step, save_path, writer=None, wandb=None, wandb_r
 
     counts = counts.detach().cpu()
     metrics = codebook_usage_metrics(counts, split)
+    summary = codebook_layer_summary(counts, metrics, split)
     if split == "val":
         # Training logs this name per batch; do not overwrite it with interval usage.
         metrics["val/codebook_usage_score"] = codebook_usage_score(counts).item()
@@ -724,6 +795,9 @@ def log_codebook_usage(counts, step, save_path, writer=None, wandb=None, wandb_r
         if metric == "dominant_fraction":
             ax.set_ylim(0.5 / counts.shape[1], 1)
             ax.set_yscale("log")
+            ax.axhline(1 / counts.shape[1], color="gray", linestyle="--",
+                       label=f"Uniform: 1/{counts.shape[1]}")
+            ax.legend(fontsize="small")
     for ax in axes[1]:
         ax.remove()
     ax = figure.add_subplot(figure.axes[0].get_subplotspec().get_gridspec()[1, :])
@@ -740,6 +814,7 @@ def log_codebook_usage(counts, step, save_path, writer=None, wandb=None, wandb_r
     figure.suptitle(f"{split.capitalize()} codebook usage · {step + 1} completed updates")
     output = Path(save_path) / "plots" / f"step_{step + 1:06d}"
     output.mkdir(parents=True, exist_ok=True)
+    summary_figures = {}
     try:
         # Preserve existing validation filenames; training gets its own files.
         prefix = "" if split == "val" else f"{split}_"
@@ -747,15 +822,42 @@ def log_codebook_usage(counts, step, save_path, writer=None, wandb=None, wandb_r
         figure.savefig(path, dpi=160)
         # Retain exact counts so metrics can be recomputed without inference.
         torch.save(counts, output / f"{prefix}codebook_counts.pt")
+        history = update_codebook_summary_history(
+            output.parent / f"{split}_codebook_summary_history.json",
+            step, summary, counts.shape,
+        )
+        summary_figures = codebook_summary_figures(history, split)
+        summary_paths = {}
+        for metric, summary_figure in summary_figures.items():
+            summary_path = output / f"{prefix}{metric}_mean_sem.png"
+            summary_figure.savefig(summary_path, dpi=160)
+            summary_paths[f"{split}_codebooks/{metric}"] = summary_path
+            if writer is not None:
+                writer.add_figure(f"{split}_codebooks/{metric}", summary_figure,
+                                  global_step=step, close=False)
+        summary_scalars = {f"{split}_codebooks/{key}": value if value is not None else float("nan")
+                           for key, value in summary.items()}
         if writer is not None:
-            for key, value in metrics.items():
+            for key, value in {**metrics, **summary_scalars}.items():
                 writer.add_scalar(key, value, step)
             writer.add_figure(f"{split}/codebook_usage", figure, global_step=step, close=False)
         if wandb_run is not None:
-            wandb_run.log({"training_step": step, **metrics,
+            wandb_metrics = {}
+            for key, value in metrics.items():
+                if key.endswith("/assignments"):
+                    continue
+                if key.startswith(f"{split}/codebook_") and key.count("/") == 2:
+                    book, metric = key.split("/")[1:]
+                    key = f"{split}_codebooks/{book}_{metric}"
+                wandb_metrics[key] = value
+            wandb_run.log({"training_step": step, **wandb_metrics,
+                           **summary_scalars,
+                           **{key: wandb.Image(str(value)) for key, value in summary_paths.items()},
                            f"{split}/codebook_usage": wandb.Image(str(path))})
     finally:
         figure.clear()
+        for summary_figure in summary_figures.values():
+            summary_figure.clear()
 
 
 def validate(state, val_dataloader, accel):
