@@ -2,7 +2,7 @@
 
 Run on the reserved physical GPU XXX ::
     CUDA_VISIBLE_DEVICES=3 python scripts/train_cw.py --args.load conf/base_cw_audio.yml
-    CUDA_VISIBLE_DEVICES=7 python scripts/train_cw.py --args.load conf/base_cw_eeg.yml
+    CUDA_VISIBLE_DEVICES=1 python scripts/train_cw.py --args.load conf/base_cw_eeg.yml
 """
 
 import os
@@ -34,6 +34,16 @@ from torch.utils.tensorboard import SummaryWriter
 
 import dac
 from dac.utils.provenance import create_launch_record, link_wandb_launch
+from dac.utils.codebook_charts import wandb_summary_charts
+from dac.utils.gradient_diagnostics import (
+    GENERATOR_CLIP_NORM,
+    GradientDiagnostics as GradientMonitor,
+    GradientDiagnosticLogger,
+    component_losses,
+    define_wandb_metrics as define_gradient_metrics,
+    log_training_metrics,
+    validate_schedule,
+)
 
 
 # ADDED FOR EEG EXPERIMENT TRACKING: optional Weights & Biases configuration.
@@ -51,6 +61,7 @@ def WandB(
     stft_window_length: int = 256,
     watch_model: bool = False,
     interrupt_timeout: float = 30.0,
+    codebook_chart_presets: dict = {},
 ) -> dict:
     if log_freq < 1:
         raise ValueError("WandB.log_freq must be at least 1")
@@ -58,6 +69,11 @@ def WandB(
         raise ValueError("WandB.stft_window_length must be at least 4")
     if not math.isfinite(interrupt_timeout) or interrupt_timeout <= 0:
         raise ValueError("WandB.interrupt_timeout must be finite and positive")
+    if codebook_chart_presets and (
+        set(codebook_chart_presets) != {"linear", "log"}
+        or any(not isinstance(value, str) or not value for value in codebook_chart_presets.values())
+    ):
+        raise ValueError("WandB.codebook_chart_presets needs both linear and log preset IDs")
     return {
         "enabled": enabled,
         "project": project,
@@ -71,7 +87,18 @@ def WandB(
         "stft_window_length": stft_window_length,
         "watch_model": watch_model,
         "interrupt_timeout": interrupt_timeout,
+        "codebook_chart_presets": dict(codebook_chart_presets),
     }
+
+
+@argbind.bind()
+def GradientDiagnostics(
+    enabled: bool = False,
+    every_steps: int = 1000,
+    early_steps: list = [1, 2, 5, 10],
+) -> dict:
+    validate_schedule(every_steps, early_steps)
+    return {"enabled": enabled, "every_steps": every_steps, "early_steps": list(early_steps)}
 
 
 # ADDED FOR EEG: one consistent, training-integrated diagnostic plot schedule.
@@ -117,14 +144,17 @@ def initialize_wandb(config: dict, args, output: Path, model: torch.nn.Module):
     run = wandb.init(**init_kwargs)
     # This trainer is iteration-based; validation uses the same step axis.
     run.define_metric("training_step")
+    if args.get("GradientDiagnostics.enabled", False):
+        define_gradient_metrics(run)
     for namespace in ("train/*", "val/*", "train_codebooks/*", "val_codebooks/*"):
         run.define_metric(namespace, step_metric="training_step")
-    # Keep summary values queryable without creating duplicate scalar panels.
+    # Native mean curves support run overlays without custom chart presets.
     for split in ("train", "val"):
         for metric in ("utilization", "perplexity", "dominant_fraction"):
             for statistic in ("mean", "sem"):
-                run.define_metric(f"{split}_codebooks/{metric}_{statistic}",
-                                  step_metric="training_step", hidden=True)
+                name = f"mean_{metric}" if statistic == "mean" else f"{metric}_sem"
+                run.define_metric(f"{split}_codebooks/{name}",
+                                  step_metric="training_step", hidden=statistic != "mean")
         run.define_metric(f"{split}_codebooks/observed_layers",
                           step_metric="training_step", hidden=True)
     run.define_metric("reconstruction_step")
@@ -442,7 +472,7 @@ def val_loop(batch, state, accel, codebook_counts=None):
 
 
 @timer()
-def train_loop(state, batch, accel, lambdas, codebook_counts=None):
+def train_loop(state, batch, accel, lambdas, codebook_counts=None, gradient_diagnostics=None):
     state.generator.train()
     if state.use_gan:
         state.discriminator.train()
@@ -481,6 +511,8 @@ def train_loop(state, batch, accel, lambdas, codebook_counts=None):
         import ipdb; state.tracker.live.stop(); ipdb.set_trace()
 
 
+    diagnostic_due = gradient_diagnostics is not None and gradient_diagnostics.due(state.tracker.step)
+    discriminator_sample = None
     if state.use_gan:
         with accel.autocast():
             output["adv/disc_loss"] = state.gan_loss.discriminator_loss(recons, signal)
@@ -488,6 +520,8 @@ def train_loop(state, batch, accel, lambdas, codebook_counts=None):
         state.optimizer_d.zero_grad()
         accel.backward(output["adv/disc_loss"])
         accel.scaler.unscale_(state.optimizer_d)
+        if diagnostic_due:
+            discriminator_sample = gradient_diagnostics.measure_discriminator(state.discriminator)
         output["other/grad_norm_d"] = torch.nn.utils.clip_grad_norm_(
             state.discriminator.parameters(), 10.0
         )
@@ -511,11 +545,26 @@ def train_loop(state, batch, accel, lambdas, codebook_counts=None):
         output["loss"] = sum([v * output[k] for k, v in lambdas.items() if k in output])
 
     state.optimizer_g.zero_grad()
+    gradient_sample = None
+    if diagnostic_due:
+        gradient_sample = gradient_diagnostics.measure_components(
+            component_losses(output, lambdas, state.stft_loss)
+        )
+        if discriminator_sample is not None:
+            gradient_sample["diagnostic_seconds"] += discriminator_sample.pop("diagnostic_seconds")
+            gradient_sample.update(discriminator_sample)
     accel.backward(output["loss"])
     accel.scaler.unscale_(state.optimizer_g)
+    if gradient_sample is not None:
+        gradient_diagnostics.measure_total(gradient_sample)
     output["other/grad_norm"] = torch.nn.utils.clip_grad_norm_(
-        state.generator.parameters(), 1e3
+        state.generator.parameters(), GENERATOR_CLIP_NORM
     )
+    if gradient_sample is not None:
+        # Tracker ignores nested dictionaries, so sampled metrics never become stale.
+        output["_gradient_diagnostics"] = gradient_diagnostics.finish(
+            gradient_sample, output["other/grad_norm"]
+        )
     accel.step(state.optimizer_g)
     state.scheduler_g.step()
     accel.update()
@@ -772,7 +821,7 @@ def codebook_summary_figures(history, split):
 
 
 def log_codebook_usage(counts, step, save_path, writer=None, wandb=None, wandb_run=None,
-                       split="val"):
+                       split="val", chart_presets=None):
     """Log usage over a validation pass or recent training interval."""
     from matplotlib.colors import LogNorm
     from matplotlib.figure import Figure
@@ -827,11 +876,9 @@ def log_codebook_usage(counts, step, save_path, writer=None, wandb=None, wandb_r
             step, summary, counts.shape,
         )
         summary_figures = codebook_summary_figures(history, split)
-        summary_paths = {}
         for metric, summary_figure in summary_figures.items():
             summary_path = output / f"{prefix}{metric}_mean_sem.png"
             summary_figure.savefig(summary_path, dpi=160)
-            summary_paths[f"{split}_codebooks/{metric}"] = summary_path
             if writer is not None:
                 writer.add_figure(f"{split}_codebooks/{metric}", summary_figure,
                                   global_step=step, close=False)
@@ -850,9 +897,19 @@ def log_codebook_usage(counts, step, save_path, writer=None, wandb=None, wandb_r
                     book, metric = key.split("/")[1:]
                     key = f"{split}_codebooks/{book}_{metric}"
                 wandb_metrics[key] = value
+            summary_charts = (
+                wandb_summary_charts(history, split, wandb, wandb_run, chart_presets)
+                if chart_presets else {}
+            )
+            # Keep JSON/TensorBoard history compatible; W&B means sort together.
+            wandb_summary = {
+                (f"{split}_codebooks/mean_{key.rsplit('/', 1)[1][:-5]}"
+                 if key.endswith("_mean") else key): value
+                for key, value in summary_scalars.items()
+            }
             wandb_run.log({"training_step": step, **wandb_metrics,
-                           **summary_scalars,
-                           **{key: wandb.Image(str(value)) for key, value in summary_paths.items()},
+                           **wandb_summary,
+                           **summary_charts,
                            f"{split}/codebook_usage": wandb.Image(str(path))})
     finally:
         figure.clear()
@@ -934,9 +991,19 @@ def train(
     )
     # Save/log the derived value rather than load()'s compatibility default.
     args["use_gan"] = use_gan
+    gradient_config = GradientDiagnostics()
+    args.update({f"GradientDiagnostics.{key}": value for key, value in gradient_config.items()})
     is_primary = int(os.environ.get("RANK", accel.local_rank)) == 0
     launch = save_run_configuration(args, Path(save_path)) if is_primary else None
     state = load(args, accel, tracker, save_path, use_gan=use_gan)
+    gradient_diagnostics = None
+    diagnostic_logger = None
+    if gradient_config["enabled"]:
+        gradient_diagnostics = GradientMonitor(
+            accel.unwrap(state.generator), accel,
+            every_steps=gradient_config["every_steps"], early_steps=gradient_config["early_steps"],
+        )
+        diagnostic_logger = GradientDiagnosticLogger(save_path, tracker.step)
     if launch is not None:
         state.launch_id = launch.name
         tracker.print(f"Launch provenance: {launch}")
@@ -998,19 +1065,18 @@ def train(
         with tracker.live:
             for tracker.step, batch in enumerate(train_dataloader, start=tracker.step):
                 output = train_loop(state, batch, accel, lambdas,
-                                    codebook_counts=train_codebook_counts)
+                                    codebook_counts=train_codebook_counts,
+                                    gradient_diagnostics=gradient_diagnostics)
 
                 last_iter = (
                     tracker.step == num_iters - 1 if num_iters is not None else False
                 )
-                if wandb_run is not None and (
-                    tracker.step % wandb_config["log_freq"] == 0 or last_iter
-                ):
-                    wandb_run.log({
-                        "training_step": tracker.step,
-                        **{f"train/{key}": value for key, value in output.items()
-                           if isinstance(value, (int, float))},
-                    })
+                log_training_metrics(
+                    output, tracker.step,
+                    normal_due=tracker.step % wandb_config["log_freq"] == 0 or last_iter,
+                    diagnostic_logger=diagnostic_logger, writer=writer,
+                    wandb=wandb, wandb_run=wandb_run,
+                )
                 if reconstruction_due(tracker.step + 1, save_iters, sample_freq, last_iter):
                     save_samples(
                         state, val_idx, writer, wandb,
@@ -1024,6 +1090,7 @@ def train(
                         log_codebook_usage(
                             train_codebook_counts, tracker.step, save_path,
                             writer, wandb, wandb_run, split="train",
+                            chart_presets=wandb_config["codebook_chart_presets"],
                         )
                     train_codebook_counts.zero_()
                     validation_output = validate(state, val_dataloader, accel)
@@ -1031,6 +1098,7 @@ def train(
                         log_codebook_usage(
                             validation_output["codebook_counts"], tracker.step,
                             save_path, writer, wandb, wandb_run,
+                            chart_presets=wandb_config["codebook_chart_presets"],
                         )
                     if wandb_run is not None:
                         # Tracker stores the full validation pass means, whereas

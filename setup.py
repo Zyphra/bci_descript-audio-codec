@@ -36,6 +36,7 @@ setup(
         "tqdm",
     ],
     extras_require={
+        "tracking": ["wandb>=0.17.9", "plotly>=5.24.1,<6"],
         "dev": [
             "pytest",
             "pytest-cov",
