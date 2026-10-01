@@ -2,7 +2,7 @@
 
 Run on the reserved physical GPU XXX ::
     CUDA_VISIBLE_DEVICES=3 python scripts/train_cw.py --args.load conf/base_cw_audio.yml
-    CUDA_VISIBLE_DEVICES=1 python scripts/train_cw.py --args.load conf/base_cw_eeg.yml
+    CUDA_VISIBLE_DEVICES=2 python scripts/train_cw.py --args.load conf/base_cw_eeg.yml
 """
 
 import os
@@ -15,6 +15,7 @@ from contextlib import ExitStack, contextmanager
 import sys
 import warnings
 from dataclasses import dataclass
+from itertools import count
 from pathlib import Path
 from typing import Optional
 
@@ -34,6 +35,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 import dac
 from dac.utils.provenance import create_launch_record, link_wandb_launch
+from dac.utils.wandb_resume import prepare_wandb_run
 from dac.utils.codebook_charts import wandb_summary_charts
 from dac.utils.gradient_diagnostics import (
     GENERATOR_CLIP_NORM,
@@ -54,6 +56,7 @@ def WandB(
     entity: str = "",
     name: str = "eeg-alice",
     group: str = "",
+    notes: str = "",
     tags: list = ["eeg", "dac"],
     mode: str = "online",
     log_freq: int = 1,
@@ -80,6 +83,7 @@ def WandB(
         "entity": entity,
         "name": name,
         "group": group,
+        "notes": notes,
         "tags": tags,
         "mode": mode,
         "log_freq": log_freq,
@@ -141,6 +145,15 @@ def initialize_wandb(config: dict, args, output: Path, model: torch.nn.Module):
         init_kwargs["entity"] = config["entity"]
     if config["group"]:
         init_kwargs["group"] = config["group"]
+    if config["notes"]:
+        init_kwargs["notes"] = config["notes"]
+    if config["mode"] == "online":
+        init_kwargs["id"] = prepare_wandb_run(
+            output, project=config["project"], entity=config["entity"],
+            resume=args.get("resume", False),
+        )
+        init_kwargs["resume"] = "allow"
+        print(f"W&B run ID: {init_kwargs['id']} (resume=allow)", flush=True)
     run = wandb.init(**init_kwargs)
     # This trainer is iteration-based; validation uses the same step axis.
     run.define_metric("training_step")
@@ -578,6 +591,16 @@ def train_loop(state, batch, accel, lambdas, codebook_counts=None, gradient_diag
     return {k: v for k, v in sorted(output.items())}
 
 
+@timer()
+def train_step(state, dataloader, accel, lambdas, **kwargs):
+    """Time batch retrieval and training, including completion of CUDA work."""
+    batch = next(dataloader)
+    output = train_loop(state, batch, accel, lambdas, **kwargs)
+    if torch.device(accel.device).type == "cuda":
+        torch.cuda.synchronize(accel.device)
+    return output
+
+
 def checkpoint(state, save_iters, save_path):
     metadata = {"logs": state.tracker.history, "use_gan": state.use_gan}
     if getattr(state, "launch_id", None) is not None:
@@ -612,8 +635,9 @@ def checkpoint(state, save_iters, save_path):
             )
 
 
-def reconstruction_figures(target, reconstruction, sample_rate, window_length, title):
-    """Plot full waveforms and linear-frequency STFTs with a shared dB scale."""
+def reconstruction_figures(target, reconstruction, sample_rate, window_length, title,
+                           stft_mae=None, phase_circ_err=None):
+    """Plot waveforms, STFT magnitudes, and phases with shared comparison scales."""
     from matplotlib.figure import Figure
 
     target = target.detach().float().cpu().flatten()
@@ -624,7 +648,9 @@ def reconstruction_figures(target, reconstruction, sample_rate, window_length, t
     ax.plot(time, target.numpy(), color="#0072B2", linewidth=0.6, label="Target")
     ax.plot(time, reconstruction.numpy(), color="#D55E00", linewidth=0.6,
             alpha=0.85, label="Reconstruction")
-    ax.set(xlabel="Time (s)", ylabel="Amplitude (model input units)", title=title)
+    waveform_mae = float((target - reconstruction).abs().mean())
+    ax.set(xlabel="Time (s)", ylabel="Amplitude (model input units)",
+           title=f"{title} (MAE={waveform_mae:.4g})")
     ax.legend(loc="upper right")
     ax.grid(alpha=0.2)
 
@@ -632,10 +658,11 @@ def reconstruction_figures(target, reconstruction, sample_rate, window_length, t
     hop = max(1, window_length // 4)
     window = torch.hann_window(window_length)
     signals = torch.stack([target, reconstruction])
-    magnitude = torch.stft(
+    spectrum = torch.stft(
         signals, n_fft=window_length, hop_length=hop, window=window,
         center=True, pad_mode="constant", return_complex=True,
-    ).abs() / window.sum()
+    )
+    magnitude = spectrum.abs() / window.sum()
     db = 20 * magnitude.clamp_min(1e-10).log10()
     vmax = float(db.max())
     vmin = vmax - 80.0
@@ -650,8 +677,32 @@ def reconstruction_figures(target, reconstruction, sample_rate, window_length, t
                ylim=(0, sample_rate / 2))
     axes[0].set_ylabel("Frequency (Hz)")
     spectrogram.colorbar(mesh, ax=list(axes), label="STFT magnitude (dB re 1 input unit)")
-    spectrogram.suptitle(f"{title} — STFT ({window_length} samples, hop {hop})")
-    return waveform, spectrogram
+    stft_title = f"{title} — STFT ({window_length} samples, hop {hop})"
+    if stft_mae is not None:
+        stft_title += f"\nMAE_(mag,log)={stft_mae[0]:.4g},{stft_mae[1]:.4g}"
+    spectrogram.suptitle(stft_title)
+
+    phase = spectrum.angle()
+    phase_figure = Figure(figsize=(12, 4), layout="constrained")
+    phase_axes = phase_figure.subplots(1, 2, sharex=True, sharey=True)
+    for ax, values, label in zip(phase_axes, phase, ("Target", "Reconstruction")):
+        mesh = ax.pcolormesh(times, frequencies, values.numpy(), shading="auto",
+                             cmap="twilight", vmin=-math.pi, vmax=math.pi)
+        ax.set(title=label, xlabel="Time (s)", xlim=(0, target.numel() / sample_rate),
+               ylim=(0, sample_rate / 2))
+    phase_axes[0].set_ylabel("Frequency (Hz)")
+    colorbar = phase_figure.colorbar(mesh, ax=list(phase_axes), label="STFT phase (radians)")
+    colorbar.set_ticks([-math.pi, 0, math.pi], labels=["−π", "0", "π"])
+    if phase_circ_err is None:
+        phase_circ_err = float((1 - torch.cos(phase[1] - phase[0])).mean())
+        error_scope = "displayed scale"
+    else:
+        error_scope = "sum across loss scales"
+    phase_figure.suptitle(
+        f"{title} — STFT phase ({window_length} samples, hop {hop})"
+        f"\ncirc_err = {phase_circ_err:.4g} ({error_scope})"
+    )
+    return waveform, spectrogram, phase_figure
 
 
 def reconstruction_due(completed_steps, save_iters, sample_freq, last_iter):
@@ -693,12 +744,21 @@ def save_samples(state, val_idx, writer, wandb=None, wandb_run=None,
         output = Path(save_path) / "plots" / f"step_{completed_steps:06d}"
         output.mkdir(parents=True, exist_ok=True)
         for nb, idx in enumerate(val_idx):
+            # Match the plotted channel, using the trainer's FFT scales and
+            # log transform. Components are unweighted sums across scales.
+            _, components = state.stft_loss(
+                AudioSignal(recons.audio_data[nb:nb + 1, :1], signal.sample_rate),
+                AudioSignal(signal.audio_data[nb:nb + 1, :1], signal.sample_rate),
+                return_components=True,
+            )
             figures = reconstruction_figures(
                 signal.audio_data[nb, 0], recons.audio_data[nb, 0],
                 signal.sample_rate, stft_window_length,
                 f"Sample {idx} · iteration {completed_steps}",
+                stft_mae=(float(components["mag"]), float(components["log_mag"])),
+                phase_circ_err=float(components["phase"]),
             )
-            for kind, figure in zip(("waveform", "stft"), figures):
+            for kind, figure in zip(("waveform", "stft", "stft_phase"), figures):
                 try:
                     path = output / f"sample_{idx}_{kind}.png"
                     figure.savefig(path, dpi=160)
@@ -1013,6 +1073,7 @@ def train(
         num_workers=num_workers,
         batch_size=batch_size,
         collate_fn=state.train_data.collate,
+        persistent_workers=(num_workers > 0),
     )
     train_dataloader = get_infinite_loader(train_dataloader)
     val_dataloader = accel.prepare_dataloader(
@@ -1021,14 +1082,14 @@ def train(
         num_workers=num_workers,
         batch_size=val_batch_size,
         collate_fn=state.val_data.collate,
-        persistent_workers=True if num_workers > 0 else False,
+        persistent_workers=(num_workers > 0),
     )
 
     # Wrap the functions so that they neatly track in TensorBoard + progress bars
     # and only run when specific conditions are met.
-    global train_loop, val_loop, validate, save_samples, checkpoint
-    train_loop = tracker.log("train", "value", history=False)(
-        tracker.track("train", num_iters, completed=state.tracker.step)(train_loop)
+    global val_loop, validate, save_samples, checkpoint
+    tracked_train_step = tracker.log("train", "value", history=False)(
+        tracker.track("train", num_iters, completed=state.tracker.step)(train_step)
     )
     val_loop = tracker.track("val", len(val_dataloader))(val_loop)
     validate = tracker.log("val", "mean")(validate)
@@ -1063,10 +1124,12 @@ def train(
             model.n_codebooks, model.codebook_size, dtype=torch.long, device=accel.device
         )
         with tracker.live:
-            for tracker.step, batch in enumerate(train_dataloader, start=tracker.step):
-                output = train_loop(state, batch, accel, lambdas,
-                                    codebook_counts=train_codebook_counts,
-                                    gradient_diagnostics=gradient_diagnostics)
+            for tracker.step in count(start=tracker.step):
+                output = tracked_train_step(
+                    state, train_dataloader, accel, lambdas,
+                    codebook_counts=train_codebook_counts,
+                    gradient_diagnostics=gradient_diagnostics,
+                )
 
                 last_iter = (
                     tracker.step == num_iters - 1 if num_iters is not None else False

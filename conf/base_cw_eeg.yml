@@ -1,20 +1,20 @@
 # Model setup
 DAC.sample_rate: 256                 # EEG: was 44100
 DAC.encoder_dim: 64
-DAC.encoder_rates: [2, 2, 2, 2]      # EEG: was [2, 4, 8, 8]; hop 16 -> 16 tokens/s (audio: hop 512 -> 86 tokens/s)
+DAC.encoder_rates: [2, 2, 2, 4]      # EEG: was [2, 4, 8, 8]; hop 16 -> 16 tokens/s (audio: hop 512 -> 86 tokens/s)
 DAC.decoder_dim: 1536
-DAC.decoder_rates: [2, 2, 2, 2]      # EEG: was [8, 8, 4, 2]
+DAC.decoder_rates: [4, 2, 2, 2]      # EEG: was [8, 8, 4, 2]
 
 # Quantization
-DAC.n_codebooks: 9
-DAC.codebook_size: 1024
+DAC.n_codebooks: 1 #9
+DAC.codebook_size: 8192 #1024
 DAC.codebook_dim: 8
-DAC.quantizer_dropout: 0.0
+DAC.quantizer_dropout: 0.0 # was 1.0
 
 # Discriminator
 Discriminator.sample_rate: 256       # EEG: was 44100
 Discriminator.rates: []
-Discriminator.periods: [2, 3, 5, 7, 11]
+Discriminator.periods: [] #[2, 3, 5, 7, 11]
 Discriminator.fft_sizes: [256, 128, 64]   # EEG: was [2048, 1024, 512]; windows must be << 1280-sample clip
 Discriminator.bands:
   - [0.0, 0.1]
@@ -35,13 +35,13 @@ num_iters: 20000
 save_iters: [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000, 11000, 12000, 13000, 14000, 15000, 16000, 17000, 18000, 19000, 20000]
 valid_freq: 1000
 sample_freq: 1000
-num_workers: 32
+num_workers: 16
 val_idx: [0, 1, 2, 3, 4, 5, 6, 7]
 seed: 0
 lambdas:
   mel/loss: 0.0 # 15.0
   stft/loss: 15.0 #0.0     # defaults to 0.0, not in DAC for audio
-  waveform/loss: 0.0 #15.0 #0.0 # default to 0.0, not in DAC for audio
+  waveform/loss: 15.0 #0.0 # default to 0.0, not in DAC for audio
   adv/feat_loss: 0.0 # 2.0
   adv/gen_loss: 0.0 # 1.0
   vq/commitment_loss: 0.25
@@ -62,10 +62,10 @@ build_transform.postprocess: # after augmentation
   - Identity
 
 # Loss setup
-MultiScaleSTFTLoss.window_lengths: [256, 64]                  # EEG: was [2048, 512]
+MultiScaleSTFTLoss.window_lengths: [16, 32, 64, 128, 256] # [256, 64] # <- EEG: audio was [2048, 512]
 MultiScaleSTFTLoss.mag_weight: 1.0 # default to 1.0
 MultiScaleSTFTLoss.log_weight: 0.0 # default to 1.0
-MultiScaleSTFTLoss.phase_weight: 1.0 # default to 0.0
+MultiScaleSTFTLoss.phase_weight: 0.0 # default to 0.0
 
 #
 MelSpectrogramLoss.n_mels: [5, 10, 20, 40, 64]                # EEG: was [5, 10, 20, 40, 80, 160, 320]
@@ -94,12 +94,22 @@ AudioLoader.EEG: true                # true for EEG; false for audio
 AudioDataset.without_replacement: true
 
 train/build_dataset.folders:         
-  alice:
-    - /data/groups/bci/datasets/alice/Alice/cache/prep2/train
+  # alice:
+  #   - /data/groups/bci/datasets/alice/Alice/cache/prep2/train
+  rand1k:
+    - /data/groups/bci/datasets/processed/v8_sets/1k/train  
+  # rand10k:
+  #   - /data/groups/bci/datasets/processed/v8_sets/10k/train
+
 
 val/build_dataset.folders:
-  alice:
-    - /data/groups/bci/datasets/alice/Alice/cache/prep2/val
+  # alice:
+  #   - /data/groups/bci/datasets/alice/Alice/cache/prep2/val
+  rand1k:
+    - /data/groups/bci/datasets/processed/v8_sets/1k/val
+  # rand10k:
+  #   - /data/groups/bci/datasets/processed/v8_sets/10k/val
+
 
 # test/build_dataset.folders: # NOT USING RIGHT NOW.
 #   alice:
@@ -110,12 +120,13 @@ val/build_dataset.folders:
 # Experiment tracking using tensorboard and/or wandb
 # =============================================================================
 
-save_path: runs/dac-eeg_alice_cw_20
+save_path: runs/crt_cw_25
+resume: true
 
 WandB.enabled: true
 WandB.project: dac-eeg-cw
 WandB.entity: ""
-WandB.name: eeg_alice_cw_20
+WandB.name: crt_cw_25
 WandB.group: alice
 WandB.tags: [eeg, dac]
 WandB.mode: online
@@ -123,6 +134,7 @@ WandB.log_freq: 1
 WandB.log_reconstruction: true
 WandB.stft_window_length: 256 # samples; linear-frequency visualization
 WandB.watch_model: false
+WandB.notes: ""
 
 # Opt-in loss-by-parameter gradient diagnostics (single-device FP32).
 GradientDiagnostics.enabled: true
