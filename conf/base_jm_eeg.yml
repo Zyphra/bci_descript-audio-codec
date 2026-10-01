@@ -6,7 +6,7 @@ DAC.decoder_dim: 1536
 DAC.decoder_rates: [4, 2, 2, 2]      # EEG: was [8, 8, 4, 2]
 
 # Quantization
-DAC.n_codebooks: 5
+DAC.n_codebooks: 9
 DAC.codebook_size: 1024 #1024
 DAC.codebook_dim: 8
 DAC.quantizer_dropout: 0.0 # 1.0
@@ -252,12 +252,12 @@ val/build_dataset.folders:
 # Experiment tracking using tensorboard and/or wand0b
 # =============================================================================
 
-save_path: runs/10k_5X1024
+save_path: runs/10k_9X1024
 
 WandB.enabled: true
 WandB.project: dac-eeg-jm
 WandB.entity: ""
-WandB.name: "10k_5x1024"
+WandB.name: "10k_9x1024"
 WandB.notes: ""
 WandB.group: alice
 WandB.tags: [eeg, dac]
