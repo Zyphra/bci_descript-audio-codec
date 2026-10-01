@@ -3,3 +3,4 @@
 *.dac
 tests/
 runs/
+scripts/eval_codex/

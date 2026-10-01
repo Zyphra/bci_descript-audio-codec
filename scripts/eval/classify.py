@@ -51,7 +51,7 @@ DECIM = 3        # time decimation for CSP input (256 Hz -> 85 Hz; signal is 8-3
 
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import GroupKFold, StratifiedKFold
+from sklearn.model_selection import GroupKFold, StratifiedGroupKFold, StratifiedKFold
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -113,6 +113,35 @@ def logvar(x):
     return out
 
 
+def universal_feats(x):
+    """Task-agnostic feature set: 48 per-channel numbers + a pairwise block.
+
+    Per channel: 1 Hz log-spectrum 1-40 Hz (39), relative power in the 5 canonical
+    bands (5), log-variance (1), spectral centroid, spectral entropy, 1/f slope (3).
+    Pairwise: tangent-space of the 8-30 Hz covariance (C*(C+1)/2).
+    -> [W, C*48 + C*(C+1)/2]; selectable per task via wave="universal".
+    """
+    f, p = psd(x)
+    sel = (f >= 1) & (f < 40)
+    fs = f[sel].astype(np.float32)
+    ps = p[..., sel]                                     # [W, C, 39]
+    tot = ps.sum(-1) + 1e-20                             # [W, C]
+    logp = np.log(ps + 1e-20)
+    rel = np.stack([ps[..., (fs >= lo) & (fs < hi)].sum(-1) for lo, hi in BANDS.values()],
+                   -1) / tot[..., None]                  # [W, C, 5]
+    centroid = (ps * fs).sum(-1) / tot                   # [W, C]
+    pn = ps / tot[..., None]
+    entropy = -(pn * np.log(pn + 1e-20)).sum(-1)         # [W, C]
+    lf = np.log(fs)                                      # 1/f slope: log-log LSQ fit
+    lf_c = lf - lf.mean()
+    slope = (logp * lf_c).sum(-1) / (lf_c ** 2).sum()    # [W, C]
+    per_ch = np.concatenate(
+        [logp, rel, logvar(x)[..., None], centroid[..., None],
+         entropy[..., None], slope[..., None]], -1)      # [W, C, 48]
+    return np.concatenate([per_ch.reshape(len(x), -1),
+                           tangent_feats(mu_beta(x))], -1).astype(np.float32)
+
+
 def alpha_occ(x, ch_names):
     idx = [ch_names.index(c) for c in OCCIPITAL if c in ch_names]
     f, p = psd(np.ascontiguousarray(x[:, idx]))
@@ -122,13 +151,18 @@ def alpha_occ(x, ch_names):
 
 
 def code_hist(codes, n_frames, vocab):
-    """codes [W, C, Q, F] -> normalized histogram per (channel, book) [W, C*Q*vocab]."""
+    """codes [W, C, Q, F] -> normalized histogram per (channel, book) [W, C*Q*vocab].
+
+    One bincount per chunk instead of a loop over the vocabulary: O(frames) not
+    O(vocab*frames), which matters for 4096/8192-entry codebooks."""
     W, C, Q, _ = codes.shape
-    c = codes[..., :n_frames]
-    out = np.zeros((W, C, Q, vocab), np.float32)
-    for v in range(vocab):
-        out[..., v] = (c == v).mean(-1)
-    return out.reshape(W, -1)
+    out = np.empty((W, C * Q * vocab), np.float32)
+    for a in range(0, W, CHUNK):
+        c = codes[a:a + CHUNK, ..., :n_frames].reshape(-1, n_frames).astype(np.int64)
+        idx = c + np.arange(c.shape[0], dtype=np.int64)[:, None] * vocab
+        cnt = np.bincount(idx.ravel(), minlength=c.shape[0] * vocab)
+        out[a:a + CHUNK] = (cnt / n_frames).astype(np.float32).reshape(-1, C * Q * vocab)
+    return out
 
 
 def latent_stats(lat, n_frames):
@@ -142,50 +176,89 @@ def latent_stats(lat, n_frames):
 
 # ---------------- classifiers ----------------
 
-def _fold(clf_fn, Xfit, Xtest, y, tr, te):
-    """One CV fold. Xfit and Xtest differ only for the transfer test."""
+def _score(pred, yt, metric):
+    if metric == "balanced":
+        return np.mean([(pred[yt == c] == c).mean() for c in np.unique(yt)])
+    return (pred == yt).mean()
+
+
+def _fold(clf_fn, Xfit, Xtest, y, groups, tr, te, metric="acc"):
+    """One CV fold. Xfit and Xtest differ only for the transfer test.
+
+    metric "acc" = plain accuracy; "balanced" = mean per-class recall (chance stays
+    1/n_classes under class imbalance, e.g. p300's 17% targets).
+    Returns (fold_score, {subject: subject_score}) — the per-subject out-of-fold
+    scores feed the paired-degradation / bootstrap analysis."""
     with threadpool_limits(limits=BLAS_THREADS):
         clf = clf_fn()
         clf.fit(Xfit[tr], y[tr])
-        return (clf.predict(Xtest[te]) == y[te]).mean()
+        pred = clf.predict(Xtest[te])
+        yt, gt = y[te], groups[te]
+        per_sub = {sj: _score(pred[gt == sj], yt[gt == sj], metric) for sj in np.unique(gt)}
+        return _score(pred, yt, metric), per_sub
 
 
-def _within_folds(y, groups, n_splits=4, min_trials=16):
-    """(fit_idx, test_idx) pairs that stay inside one subject.
+def _within_folds(y, groups, blocks=None, n_splits=4, min_trials=16):
+    """(fit_idx, test_idx, subject) triples that stay inside one subject.
 
     Motor decoding does not transfer across subjects: CSP spatial filters are
     subject-specific, so cross-subject CSP sits near chance and leaves no headroom
     to detect codec degradation. Scoring within subject restores a usable baseline.
     The codec never saw any of this data, so within-subject CV leaks nothing about it.
+
+    blocks: optional per-window block ids (recording run, film clip, stimulus block).
+    When given, folds split BY BLOCK inside each subject — windows of one block never
+    straddle train/test. Without it, same-block windows would leak (labels constant or
+    autocorrelated within a block, e.g. SEED clips, P300 runs) and inflate accuracy.
     """
     folds = []
     for s in np.unique(groups):
         idx = np.flatnonzero(groups == s)
         if len(idx) < min_trials or len(np.unique(y[idx])) < 2:
             continue
-        for tr, te in StratifiedKFold(n_splits, shuffle=True, random_state=0).split(idx, y[idx]):
-            folds.append((idx[tr], idx[te]))
+        if blocks is not None:
+            b = blocks[idx]
+            k = min(n_splits, len(np.unique(b)))
+            if k < 2:
+                continue
+            # StratifiedGroupKFold keeps every class present in each fold where the
+            # group structure permits (plain GroupKFold gave SEED test folds with no
+            # neutral clips — external-review finding)
+            sgk = StratifiedGroupKFold(k, shuffle=True, random_state=0)
+            for tr, te in sgk.split(idx, y[idx], b):
+                folds.append((idx[tr], idx[te], s))
+        else:
+            for tr, te in StratifiedKFold(n_splits, shuffle=True, random_state=0).split(idx, y[idx]):
+                folds.append((idx[tr], idx[te], s))
     return folds
 
 
-def _cv(Xfit, Xtest, y, groups, clf_fn, within):
+def _cv(Xfit, Xtest, y, groups, clf_fn, within, metric="acc", blocks=None):
+    """Returns (mean, std, per_subject) where mean/std are ACROSS SUBJECTS for both CV
+    regimes (cross-subject previously reported fold SD — external-review fix), and
+    per_subject maps subject -> mean out-of-fold score."""
     n_groups = len(np.unique(groups))
-    folds = (_within_folds(y, groups) if within
-             else list(GroupKFold(min(5, n_groups)).split(Xfit, y, groups)))
-    accs = Parallel(n_jobs=min(len(folds), N_JOBS))(
-        delayed(_fold)(clf_fn, Xfit, Xtest, y, tr, te) for tr, te in folds)
-    if within:  # average per subject first, then report spread across subjects
-        per_sub = np.mean(np.asarray(accs).reshape(-1, 4), axis=1)
-        return np.mean(per_sub), np.std(per_sub)
-    return np.mean(accs), np.std(accs)
+    if within:
+        folds = [(tr, te) for tr, te, _ in _within_folds(y, groups, blocks)]
+    else:
+        folds = list(GroupKFold(min(5, n_groups)).split(Xfit, y, groups))
+    results = Parallel(n_jobs=min(len(folds), N_JOBS))(
+        delayed(_fold)(clf_fn, Xfit, Xtest, y, groups, tr, te, metric) for tr, te in folds)
+    per_sub = {}
+    for _, d in results:
+        for sj, a in d.items():
+            per_sub.setdefault(sj, []).append(a)
+    per_sub = {sj: float(np.mean(v)) for sj, v in per_sub.items()}
+    vals = list(per_sub.values())
+    return float(np.mean(vals)), float(np.std(vals)), per_sub
 
 
-def cv_score(X, y, groups, clf_fn, within=False):
-    return _cv(X, X, y, groups, clf_fn, within)
+def cv_score(X, y, groups, clf_fn, within=False, metric="acc", blocks=None):
+    return _cv(X, X, y, groups, clf_fn, within, metric, blocks)
 
 
-def cv_transfer(Xo, Xr, y, groups, clf_fn, within=False):
-    return _cv(Xo, Xr, y, groups, clf_fn, within)
+def cv_transfer(Xo, Xr, y, groups, clf_fn, within=False, metric="acc", blocks=None):
+    return _cv(Xo, Xr, y, groups, clf_fn, within, metric, blocks)
 
 
 def csp_lda():
@@ -243,6 +316,75 @@ def mu_beta(x):
         xf -= xf.mean(-1, keepdims=True)
         covs[i : i + CHUNK] = np.einsum("wct,wdt->wcd", xf, xf) / (xf.shape[-1] - 1)
     return covs
+
+
+def erp_feats(x):
+    """Time-course features for ERP tasks: polyphase resample 256 Hz -> 32 Hz
+    (proper FIR anti-aliasing; the previous 8-sample boxcar attenuated 20 Hz by only
+    ~6.5 dB and allowed aliasing — external-review finding), flatten channels x time.
+    Preserves waveform SHAPE and timing — what P300 decoding needs and a codec may
+    distort."""
+    from scipy.signal import resample_poly
+    W, C, T = x.shape
+    out = None
+    for a in range(0, W, CHUNK):
+        r = resample_poly(x[a : a + CHUNK].astype(np.float64), 1, 8, axis=-1)
+        if out is None:
+            out = np.empty((W, C, r.shape[-1]), np.float32)
+        out[a : a + CHUNK] = r
+    return out.reshape(W, -1)
+
+
+def tangent_feats(covs):
+    """Log-Euclidean covariance features: upper triangle of logm(cov) per trial.
+    (Not the fitted affine-invariant tangent-space pipeline.) Multiclass-native,
+    feeds logistic regression."""
+    W, C, _ = covs.shape
+    iu = np.triu_indices(C)
+    out = np.empty((W, len(iu[0])), np.float64)
+    for i in range(W):
+        w, v = scipy.linalg.eigh(covs[i])
+        L = (v * np.log(np.maximum(w, 1e-12))) @ v.T
+        out[i] = L[iu]
+    return out
+
+
+def fine_spec(x, lo=7.0, hi=32.0):
+    """Full-window log power spectrum at the window's native resolution (0.25 Hz for
+    4 s trials): SSVEP classes are 0.5 Hz apart, far finer than the 5-band features.
+    Includes first harmonics up to `hi`. Chunked like everything else."""
+    W, C, T = x.shape
+    f = np.fft.rfftfreq(T, 1 / SR)
+    m = (f >= lo) & (f <= hi)
+    out = np.empty((W, C * int(m.sum())), np.float32)
+    for a in range(0, W, CHUNK):
+        F = np.fft.rfft(x[a : a + CHUNK], axis=-1)
+        out[a : a + CHUNK] = np.log((F.real ** 2 + F.imag ** 2)[..., m] + 1e-20).reshape(
+            len(F), -1)
+    return out
+
+
+# How each task is scored. wave: the waveform-domain classifier family.
+#   logvar  -> per-channel log-variance + logreg (broad-effect tasks)
+#   csp     -> binary CSP+LDA on 8-30 Hz covariances (2-class motor)
+#   cov_ts  -> tangent-space + logreg (multiclass motor)
+#   erp     -> decimated time-course + logreg (timing-sensitive ERP tasks)
+# Recon-focused eval (default): score only input vs reconstructed waveform —
+# the question is how much classifier accuracy survives the codec round trip.
+# EVAL_FULL_REPS=1 restores the full representation battery (codes, latents,
+# spectra, no-gain variants, gain-only, subject-id) for deeper analyses.
+FULL_REPS = os.environ.get("EVAL_FULL_REPS", "0") == "1"
+
+TASK_CFG = {
+    "eyes":         dict(within=False, wave="logvar", eyes_extras=True),
+    "fist_lr":      dict(within=True, wave="csp", real_imag=True),
+    "fists_feet":   dict(within=True, wave="csp", real_imag=True),
+    "p300":         dict(within=True, wave="erp", metric="balanced", group_col="run"),
+    "motor_4class": dict(within=True, wave="cov_ts"),
+    "emotion":      dict(within=True, wave="logvar", group_col="clip"),
+    "ssvep":        dict(within=True, wave="finespec", group_col="block"),
+}
+DEFAULT_TASK_CFG = dict(within=True, wave="logvar")
 
 
 # ---------------- per-task evaluation ----------------
@@ -355,9 +497,11 @@ def eval_subject_id(task, meta, orig, recon, codes, lat, Fmin, kwargs):
     folds = [(np.flatnonzero(runs != r), np.flatnonzero(runs == r)) for r in uruns]
     out = []
     for name, X in feats.items():
-        accs = Parallel(n_jobs=min(len(folds), N_JOBS))(
-            delayed(_fold)(logreg, X, X, subj, tr, te) for tr, te in folds)
-        out.append((f"subject_id[{task}]", "all", name, float(np.mean(accs)), float(np.std(accs))))
+        res = Parallel(n_jobs=min(len(folds), N_JOBS))(
+            delayed(_fold)(logreg, X, X, subj, subj, tr, te) for tr, te in folds)
+        accs = [a for a, _ in res]
+        out.append((f"subject_id[{task}]", "all", name,
+                    float(np.mean(accs)), float(np.std(accs)), len(np.unique(subj))))
     print(f"  subject_id[{task}] done ({len(np.unique(subj))}-way, leave-one-run-out, "
           f"chance {100/len(np.unique(subj)):.1f}%)")
     return out
@@ -375,9 +519,14 @@ def eval_task(res_dir, task):
     meta, kwargs, ch_names, hop, Tmin, orig_n, recon_n, codes, gains = load_task(res_dir, task)
     _mark(f"{task}: loaded")
     Fmin = Tmin // hop
-    lat = latents_from_codes(res_dir, codes, kwargs, Fmin)
-    _mark(f"{task}: latents")
-    y = (meta.label == sorted(meta.label.unique())[1]).to_numpy().astype(int)
+    lat = None
+    if FULL_REPS:
+        lat = latents_from_codes(res_dir, codes, kwargs, Fmin)
+        _mark(f"{task}: latents")
+    cfg = TASK_CFG.get(task, DEFAULT_TASK_CFG)
+    classes = sorted(meta.label.unique())
+    y = np.searchsorted(classes, meta.label.to_numpy())  # ==0/1 for binary, multiclass-native
+    n_classes = len(classes)
     groups = meta.subject.to_numpy()
     orig = np.empty_like(orig_n)
     recon = np.empty_like(recon_n)
@@ -386,57 +535,98 @@ def eval_task(res_dir, task):
         recon[a : a + CHUNK] = recon_n[a : a + CHUNK] * gains[a : a + CHUNK]
 
     subsets = {"all": np.ones(len(meta), bool)}
-    if task != "eyes":
-        # real / imagined only: the pooled "all" mixes two different effect sizes and
-        # costs another full set of CSP fits without telling us anything new.
+    if cfg.get("real_imag"):
+        # real / imagined separately: pooling mixes two different effect sizes
         subsets = {
             "real": ~meta.imagined.to_numpy(),
             "imagined": meta.imagined.to_numpy(),
         }
 
-    feats = {
-        "orig_spec": bandpower(orig),
-        "recon_spec": bandpower(recon),
-        "codes": code_hist(codes, Fmin, kwargs["codebook_size"]),
-        "latents": latent_stats(lat, Fmin),
-    }
-    if task == "eyes":
+    metric = cfg.get("metric", "acc")
+    feats = {}
+    if FULL_REPS:
+        feats.update({
+            "orig_spec": bandpower(orig),
+            "recon_spec": bandpower(recon),
+            "codes": code_hist(codes, Fmin, kwargs["codebook_size"]),
+            "latents": latent_stats(lat, Fmin),
+            # per-channel-window gains alone: how much task signal rides in the side
+            # channel the codec transmits separately (external-review request)
+            "gain_only": np.log(gains[:, :, 0] + 1e-20),
+        })
+    # waveform-domain classifier family for this task
+    wave = cfg["wave"]
+    if wave == "logvar":
         feats["orig_wave"] = logvar(orig)
         feats["recon_wave"] = logvar(recon)
+        if FULL_REPS:
+            feats["orig_wave_nogain"] = logvar(orig_n)
+            feats["recon_wave_nogain"] = logvar(recon_n)
+        wave_pairs, wave_clf = None, logreg
+    elif wave == "erp":
+        feats["orig_wave"] = erp_feats(orig)
+        feats["recon_wave"] = erp_feats(recon)
+        wave_pairs, wave_clf = None, logreg
+    elif wave == "finespec":
+        feats["orig_wave"] = fine_spec(orig)
+        feats["recon_wave"] = fine_spec(recon)
+        wave_pairs, wave_clf = None, logreg
+    elif wave == "universal":
+        feats["orig_wave"] = universal_feats(orig)
+        feats["recon_wave"] = universal_feats(recon)
+        wave_pairs, wave_clf = None, logreg
+    elif wave == "cov_ts":
+        feats["orig_wave"] = tangent_feats(mu_beta(orig))
+        feats["recon_wave"] = tangent_feats(mu_beta(recon))
+        wave_pairs, wave_clf = None, logreg
+    else:  # csp: binary covariance pipeline, kept out of `feats` (its own classifier)
+        wave_pairs = [("orig_wave", mu_beta(orig)), ("recon_wave", mu_beta(recon))]
+        if FULL_REPS:
+            wave_pairs += [("orig_wave_nogain", mu_beta(orig_n)),
+                           ("recon_wave_nogain", mu_beta(recon_n))]
+        wave_clf = csp_lda
+    if cfg.get("eyes_extras"):
         feats["alpha_occ_orig"] = alpha_occ(orig, ch_names)
         feats["alpha_occ_recon"] = alpha_occ(recon, ch_names)
-        feats["orig_wave_nogain"] = logvar(orig_n)
-        feats["recon_wave_nogain"] = logvar(recon_n)
-    else:
-        wave_o, wave_r = mu_beta(orig), mu_beta(recon)
-        wave_o_ng, wave_r_ng = mu_beta(orig_n), mu_beta(recon_n)  # gain NOT restored
 
-    # Motor decoding is subject-specific (CSP filters do not transfer), so it is scored
-    # within subject; eyes has a strong cross-subject effect and stays cross-subject.
-    within = task != "eyes"
+    within = cfg["within"]
+    gcol = cfg.get("group_col")
+    blocks_all = meta[gcol].to_numpy() if (gcol and gcol in meta.columns) else None
+    if gcol and blocks_all is None:
+        raise ValueError(f"{task}: required group column '{gcol}' missing from labels — "
+                         "refusing to run leakable folds")
     _mark(f"{task}: features built")
-    rows = []
+    rows, subj_rows = [], []
+
+    def add(sub, name, res):
+        m, s, ps = res
+        rows.append((task, sub, name, m, s, n_classes))
+        subj_rows.extend((task, sub, name, sj, a) for sj, a in ps.items())
+        return m, s
+
     for sub, mask in subsets.items():
         g, yy = groups[mask], y[mask]
+        bb = blocks_all[mask] if blocks_all is not None else None
         for name, X in feats.items():
-            m, s = cv_score(X[mask], yy, g, logreg, within)
+            add(sub, name, cv_score(X[mask], yy, g, logreg, within, metric, bb))
             _mark(f"{task}/{sub}: {name}")
-            rows.append((task, sub, name, m, s))
-        if task == "eyes":
-            m, s = cv_transfer(feats["orig_wave"][mask], feats["recon_wave"][mask], yy, g, logreg)
+        if wave_pairs is None:
+            res = cv_transfer(feats["orig_wave"][mask], feats["recon_wave"][mask],
+                              yy, g, wave_clf, within, metric, bb)
         else:
-            for name, X in (("orig_wave", wave_o), ("recon_wave", wave_r),
-                            ("orig_wave_nogain", wave_o_ng), ("recon_wave_nogain", wave_r_ng)):
-                m, s = cv_score(X[mask], yy, g, csp_lda, within)
-                rows.append((task, sub, name, m, s))
-            m, s = cv_transfer(wave_o[mask], wave_r[mask], yy, g, csp_lda, within)
-        rows.append((task, sub, "transfer_orig->recon", m, s))
-        m, s = cv_transfer(feats["orig_spec"][mask], feats["recon_spec"][mask], yy, g, logreg, within)
-        rows.append((task, sub, "transfer_spec", m, s))
+            for name, X in wave_pairs:
+                add(sub, name, cv_score(X[mask], yy, g, wave_clf, within, metric, bb))
+            res = cv_transfer(wave_pairs[0][1][mask], wave_pairs[1][1][mask],
+                              yy, g, wave_clf, within, metric, bb)
+        add(sub, "transfer_orig->recon", res)
+        if FULL_REPS:
+            add(sub, "transfer_spec", cv_transfer(feats["orig_spec"][mask], feats["recon_spec"][mask],
+                                                  yy, g, logreg, within, metric, bb))
         cv = "within-subject" if within else "cross-subject"
-        print(f"  {task}/{sub} done ({mask.sum()} windows, {len(np.unique(g))} subjects, {cv} CV)")
+        print(f"  {task}/{sub} done ({mask.sum()} windows, {len(np.unique(g))} subjects, "
+              f"{n_classes}-class, {cv} CV, metric={metric})")
 
-    if task == "eyes":  # 2 runs -> clean leave-one-run-out; motor tasks would be 109-way
+    if task == "eyes" and FULL_REPS:  # 2 runs -> clean leave-one-run-out
         _mark(f"{task}: subject_id start")
         rows += eval_subject_id(task, meta, orig, recon, codes, lat, Fmin, kwargs)
 
@@ -452,7 +642,7 @@ def eval_task(res_dir, task):
         rel_err = np.median(np.abs(r - o) / (o + 1e-20))
         corr = np.corrcoef(np.log(o + 1e-20).ravel(), np.log(r + 1e-20).ravel())[0, 1]
         band_rows.append((task, bname, rel_err, corr))
-    return rows, band_rows
+    return rows, band_rows, subj_rows
 
 
 CHART_ROWS = [  # (representation, label, color) — cyan = original arm, yellow = codec arm
@@ -506,18 +696,22 @@ def main():
         print(f"cached results found in {res_dir} — reprinting (use --force to recompute)")
         acc = pd.read_csv(acc_csv)
     else:
-        all_rows, all_bands = [], []
+        all_rows, all_bands, all_subj = [], [], []
         for task in args.tasks.split(","):
             if not (res_dir / f"{task}_windows.parquet").exists():
                 print(f"skipping {task}: no dump")
                 continue
-            r, b = eval_task(res_dir, task.strip())
+            r, b, sr = eval_task(res_dir, task.strip())
             all_rows += r
             all_bands += b
-        acc = pd.DataFrame(all_rows, columns=["task", "subset", "representation", "acc", "std"])
+            all_subj += sr
+        acc = pd.DataFrame(all_rows,
+                           columns=["task", "subset", "representation", "acc", "std", "n_classes"])
         bands = pd.DataFrame(all_bands, columns=["task", "band", "median_rel_err", "log_power_corr"])
         acc.to_csv(acc_csv, index=False)
         bands.to_csv(bands_csv, index=False)
+        pd.DataFrame(all_subj, columns=["task", "subset", "representation", "subject", "acc"]
+                     ).to_csv(res_dir / "subject_scores.csv", index=False)
 
     terminal_chart(acc)
     (res_dir / "summary.txt").write_text(terminal_chart(acc, color=False, echo=False) + "\n")

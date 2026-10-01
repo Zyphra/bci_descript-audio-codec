@@ -7,41 +7,73 @@
 #SBATCH --time=02:00:00           # quick pass fits easily; raise for the full sweep
 #SBATCH --output=scripts/eval/logs/slurm_%j.log
 #SBATCH --chdir=/data/groups/bci/jonas/workspace/bci_descript-audio-codec
-#SBATCH --nodelist=dgxh100-042    # node with our local venv copy in /scratch
+
+
+# HOW TO RUN: 
 #
-# EEGBCI classifier eval: for each checkpoint, codec the labeled windows, train
-# classifiers, print + save results. Edit the block below (SUBJ_FRACTION = how many
-# subjects), save, then from the repo root:
+# SBATCH: sbatch scripts/eval/run_eval.sh
+# sbatch helpers: 
+#   squeue -u jonas 
+#   tail -f scripts/eval/logs/slurm_<jobid>.log
+#   scancel <jobid>  
+# RESERVED: DEVICE=cuda:0 bash scripts/eval/run_eval.sh
+
+# figures rebuild automatically at the end; to refresh them alone (no GPU needed): python scripts/eval/probe_plots.py
 #
-#   cd /data/groups/bci/jonas/workspace/bci_descript-audio-codec
-#   sbatch scripts/eval/run_eval.sh              # prints: Submitted batch job <jobid>
-#   tail -f scripts/eval/logs/slurm_<jobid>.log  # watch it live (Ctrl-C stops the tail only)
-#
-#   (or run directly without slurm:  bash scripts/eval/run_eval.sh)
-#
-# Results land in scripts/eval/results/<arch>_<hash>[_s<N>]/ — one folder per checkpoint,
-# finished checkpoints are cached and skipped, so re-running is cheap.
+# RESULTS: scripts/eval/results/<run>/ 
+
+# best tasks: fist_lr + ssvep --> together 9 min per checkpoint
+
+
 
 # ========================== EDIT ME ==========================
-DEVICE="cuda:1"    # GPU when run directly on vp42 (ours: 1 and 4). Ignored under Slurm.
+[ -n "${DEVICE:-}" ] && DEVICE_EXPLICIT=1
+DEVICE="${DEVICE:-cuda:1}"    # GPU for direct runs; slurm jobs get their allocated GPU (cuda:0)
 LIGHT=0            # 1 = smoke test: eyes task only, quarter of the windows
-SUBJ_FRACTION=55   # keep every N-th subject (all their trials).
-                   #   55 -> 2 subjects, smoke-speed  |  6 -> quick pass  |  1 -> full sweep
+SUBJECTS="${SUBJECTS:-tier}" # "tier" = the battery tier per dataset (results merge
+                             # seamlessly with all previous runs and plots); or a
+                             # number (approx subjects per dataset), or "all".
 FRACTION=1         # keep every N-th window. Leave at 1: thinning windows starves CSP.
 FORCE=0            # 1 = recompute everything, ignore caches
-CKPTS=(            # run-folder names (uses their latest) or exact paths to a weights.pth
-  1k_1X16
-  1k_1X64
-  1k_1X256
-  1k_1X1024
-  1k_3X16
-  1k_5X16
-  10k_1X16
-  10k_1X64
-  10k_1X256
-  10k_1X1024
-  10k_3X16
-  10k_5X16
+# ---- tasks: 1 = run, 0 = skip (grouped by the dataset they come from) ----
+# default = the bread-and-butter probe (fist_lr + ssvep, ~9 min/ckpt); flip on
+# p300/motor_4class (+~20 min) for milestone-depth evals — all plots pick them up.
+TASK_EYES=0        # eegbci    2-class  eyes open/closed (gain-confounded canary)
+TASK_FIST_LR=1     # eegbci    2-class  left/right fist (spatial axis)
+TASK_FISTS_FEET=0  # eegbci    2-class  fists/feet (real+imagined)
+TASK_P300=0        # erpbci    2-class  target/nontarget flashes (timing axis)
+TASK_MOTOR4=0      # bciciv2a  4-class  motor imagery (harder spatial axis)
+TASK_EMOTION=0     # seed      3-class  film emotion
+TASK_SSVEP=1       # sandiego 12-class  flicker frequency (spectral axis)
+CHRIS=/data/groups/bci/chris/workspace/bci_descript-audio-codec/runs
+CKPTS=(            # full paths to weights.pth (run-folder names also work, see resolve())
+  # /data/groups/bci/jonas/workspace/bci_descript-audio-codec/runs/1k_1X16/latest/dac/weights.pth
+  # /data/groups/bci/jonas/workspace/bci_descript-audio-codec/runs/1k_1X64/latest/dac/weights.pth
+  # /data/groups/bci/jonas/workspace/bci_descript-audio-codec/runs/1k_1X256/latest/dac/weights.pth
+  # /data/groups/bci/jonas/workspace/bci_descript-audio-codec/runs/1k_1X1024/latest/dac/weights.pth
+  # /data/groups/bci/jonas/workspace/bci_descript-audio-codec/runs/1k_3X16/latest/dac/weights.pth
+  # /data/groups/bci/jonas/workspace/bci_descript-audio-codec/runs/1k_5X16/latest/dac/weights.pth
+  # /data/groups/bci/jonas/workspace/bci_descript-audio-codec/runs/10k_1X16/latest/dac/weights.pth
+  # /data/groups/bci/jonas/workspace/bci_descript-audio-codec/runs/10k_1X64/latest/dac/weights.pth
+  # /data/groups/bci/jonas/workspace/bci_descript-audio-codec/runs/10k_1X256/latest/dac/weights.pth
+  # /data/groups/bci/jonas/workspace/bci_descript-audio-codec/runs/10k_1X1024/latest/dac/weights.pth
+  # /data/groups/bci/jonas/workspace/bci_descript-audio-codec/runs/10k_3X16/latest/dac/weights.pth
+  # /data/groups/bci/jonas/workspace/bci_descript-audio-codec/runs/10k_5X16/latest/dac/weights.pth
+  # /data/groups/bci/chris/workspace/bci_descript-audio-codec/runs/crt_cw_21/latest/dac/weights.pth
+  # /data/groups/bci/chris/workspace/bci_descript-audio-codec/runs/crt_cw_22/latest/dac/weights.pth
+  # /data/groups/bci/chris/workspace/bci_descript-audio-codec/runs/crt_cw_23/latest/dac/weights.pth
+  # /data/groups/bci/chris/workspace/bci_descript-audio-codec/runs/crt_cw_24/latest/dac/weights.pth
+  # /data/groups/bci/chris/workspace/bci_descript-audio-codec/runs/crt_cw_25/latest/dac/weights.pth
+  /data/groups/bci/chris/workspace/bci_descript-audio-codec/runs/crt_cw_041/latest/dac/weights.pth
+  /data/groups/bci/chris/workspace/bci_descript-audio-codec/runs/crt_cw_042/latest/dac/weights.pth
+  /data/groups/bci/chris/workspace/bci_descript-audio-codec/runs/crt_cw_043/latest/dac/weights.pth
+  /data/groups/bci/chris/workspace/bci_descript-audio-codec/runs/crt_cw_044/latest/dac/weights.pth
+  /data/groups/bci/chris/workspace/bci_descript-audio-codec/runs/crt_cw_045/latest/dac/weights.pth
+  # /data/groups/bci/chris/workspace/bci_descript-audio-codec/runs/crt_cw_046/latest/dac/weights.pth
+  # /data/groups/bci/chris/workspace/bci_descript-audio-codec/runs/crt_cw_047/latest/dac/weights.pth
+  # /data/groups/bci/chris/workspace/bci_descript-audio-codec/runs/crt_cw_048/latest/dac/weights.pth
+  # /data/groups/bci/chris/workspace/bci_descript-audio-codec/runs/crt_cw_049/latest/dac/weights.pth
+  # /data/groups/bci/chris/workspace/bci_descript-audio-codec/runs/crt_cw_050/latest/dac/weights.pth
 )
 # =============================================================
 
@@ -52,28 +84,61 @@ REPO="/data/groups/bci/jonas/workspace/bci_descript-audio-codec"
 EVAL="$REPO/scripts/eval"
 
 # Under Slurm the allocated GPU is always visible as cuda:0.
-[ -n "${SLURM_JOB_ID:-}" ] && DEVICE="cuda:0"
+[ -n "${SLURM_JOB_ID:-}" ] && [ -z "${DEVICE_EXPLICIT:-}" ] && DEVICE="cuda:0" || true
 
 # Only one eval run at a time (two would fight over CPU and result folders).
-exec 9>"$EVAL/.run.lock"
+exec 9>/tmp/dac_eval_run.lock
 if ! flock -n 9; then
   echo "!! another run_eval.sh is already running — wait, or: pkill -f run_eval.sh" >&2
   exit 1
 fi
-trap 'kill 0' INT TERM EXIT   # killing this script kills its python children too
+# On Ctrl-C/TERM: first drop this trap (kill 0 signals our own group, which would
+# otherwise re-fire the trap forever), then take the python children down with us.
+trap 'trap - INT TERM; kill 0' INT TERM
 
 [ "$#" -gt 0 ] && CKPTS=("$@")
-TASKS="eyes,fist_lr,fists_feet"
-[ "$LIGHT" = "1" ] && { TASKS="eyes"; FRACTION=4; }
+# TASKS env (comma list of task names) overrides the toggle block entirely
+if [ -n "${TASKS:-}" ]; then
+  TASK_EYES=0; TASK_FIST_LR=0; TASK_FISTS_FEET=0; TASK_P300=0
+  TASK_MOTOR4=0; TASK_EMOTION=0; TASK_SSVEP=0
+  for t in ${TASKS//,/ }; do
+    case "$t" in
+      eyes) TASK_EYES=1 ;; fist_lr) TASK_FIST_LR=1 ;; fists_feet) TASK_FISTS_FEET=1 ;;
+      p300) TASK_P300=1 ;; motor_4class|motor4) TASK_MOTOR4=1 ;;
+      emotion) TASK_EMOTION=1 ;; ssvep) TASK_SSVEP=1 ;;
+      *) echo "unknown task '$t' (eyes fist_lr fists_feet p300 motor_4class emotion ssvep)"; exit 1 ;;
+    esac
+  done
+fi
+
+# build "dataset:task,task" pairs from the toggles
+PAIRS=()
+t=""
+[ "$TASK_EYES" = "1" ] && t="eyes"
+[ "$TASK_FIST_LR" = "1" ] && t="$t,fist_lr"
+[ "$TASK_FISTS_FEET" = "1" ] && t="$t,fists_feet"
+t="${t#,}"; [ -n "$t" ] && PAIRS+=("eegbci:$t")
+[ "$TASK_P300" = "1" ] && PAIRS+=("erpbci:p300")
+[ "$TASK_MOTOR4" = "1" ] && PAIRS+=("bciciv2a:motor_4class")
+[ "$TASK_EMOTION" = "1" ] && PAIRS+=("seed:emotion")
+[ "$TASK_SSVEP" = "1" ] && PAIRS+=("ssvep:ssvep")
+[ "$LIGHT" = "1" ] && { PAIRS=("eegbci:eyes"); FRACTION=4; }
+[ "${#PAIRS[@]}" -gt 0 ] || { echo "no tasks enabled"; exit 1; }
 FORCE_FLAG=""
 [ "$FORCE" = "1" ] && FORCE_FLAG="--force"
-echo "== tasks=$TASKS subject-fraction=$SUBJ_FRACTION window-fraction=$FRACTION device=$DEVICE =="
+echo "== tasks=${PAIRS[*]} subjects=$SUBJECTS device=$DEVICE =="
 
-# a checkpoint entry may be a folder name in runs/ or a direct path to a weights.pth
+# a checkpoint entry may be a run-folder name — searched in our runs/, chris's runs/,
+# then our own results snapshots (survives the original run being deleted) — or a
+# direct path to a weights.pth
 resolve() {
+  local snap
   if [ -f "$1" ]; then echo "$1"
   elif [ -f "$REPO/runs/$1/latest/dac/weights.pth" ]; then echo "$REPO/runs/$1/latest/dac/weights.pth"
-  else echo "NOT_FOUND"
+  elif [ -f "$CHRIS/$1/latest/dac/weights.pth" ]; then echo "$CHRIS/$1/latest/dac/weights.pth"
+  else
+    snap=$(ls "$EVAL/results/$1"/*/weights_snapshot.pth 2>/dev/null | head -1)
+    if [ -n "$snap" ]; then echo "$snap"; else echo "NOT_FOUND"; fi
   fi
 }
 
@@ -96,17 +161,19 @@ export NUMPY_MADVISE_HUGEPAGE=0
 cd "$REPO"
 
 # Work on node-local /scratch (immune to Lustre stalls), publish each finished
-# checkpoint to scripts/eval/results/ with one sequential rsync. Pre-seed the local
-# root from any already-published results so caching keeps working across nodes.
+# checkpoint to scripts/eval/results/ with one sequential rsync. Scratch is a
+# DISPOSABLE MIRROR of results/ (--delete): scripts/eval/results/ is the single
+# source of truth, so deleting results/<run>/ (or all of results/) deletes its
+# cache too — scratch is wiped to match on the next launch.
 if [ -d /scratch/jonas ]; then
   export EVAL_RESULTS_ROOT=/scratch/jonas/eval_results
   mkdir -p "$EVAL_RESULTS_ROOT" "$EVAL/results"
-  rsync -a "$EVAL/results/" "$EVAL_RESULTS_ROOT/" 2>/dev/null || true
+  rsync -a --delete "$EVAL/results/" "$EVAL_RESULTS_ROOT/" 2>/dev/null || true
 else
   export EVAL_RESULTS_ROOT="$EVAL/results"
 fi
 
-DIRS=()
+BATCH=()   # run names processed by THIS invocation (for the latest-batch figure)
 for RAW in "${CKPTS[@]}"; do
   CKPT="$(resolve "$RAW")"
   if [ "$CKPT" = "NOT_FOUND" ]; then echo "!! skipping '$RAW': no checkpoint found"; continue; fi
@@ -114,23 +181,46 @@ for RAW in "${CKPTS[@]}"; do
   echo "############################################################"
   echo "# $RAW  ->  $CKPT"
   echo "############################################################"
-  "$PY" "$EVAL/dump.py" --ckpt "$CKPT" --tasks "$TASKS" --device "$DEVICE" \
-         --fraction "$FRACTION" --subject-fraction "$SUBJ_FRACTION" $FORCE_FLAG
-  RESULTS="$(readlink -f "$EVAL_RESULTS_ROOT/_latest")"
-  "$PY" "$EVAL/classify.py" --results "$RESULTS" --tasks "$TASKS" $FORCE_FLAG
-  "$PY" "$EVAL/plots.py" --results "$RESULTS"
-  if [ "$EVAL_RESULTS_ROOT" != "$EVAL/results" ]; then
-    rsync -a "$RESULTS" "$EVAL/results/"   # publish to /data in one sequential pass
-  fi
-  DIRS+=("$RESULTS")
+  for PAIR in "${PAIRS[@]}"; do
+    DS="${PAIR%%:*}"; DSTASKS="${PAIR#*:}"
+    if [ "$SUBJECTS" = "all" ]; then SF=1
+    elif [ "$SUBJECTS" = "tier" ]; then
+      case "$DS" in eegbci) SF=9 ;; erpbci|seed) SF=2 ;; *) SF=1 ;; esac
+    else
+      SF=$("$PY" - "$DS" "$SUBJECTS" <<'PYSF'
+import sys, pandas as pd
+ds, want = sys.argv[1], int(sys.argv[2])
+n = pd.read_parquet(f"/data/groups/bci/datasets/processed/v8_sets/classifier_eval/{ds}/labels.parquet",
+                    columns=["subject"]).subject.nunique()
+print(max(1, round(n / max(1, min(want, n)))))
+PYSF
+)
+    fi
+    "$PY" "$EVAL/dump.py" --ckpt "$CKPT" --tasks "$DSTASKS" --device "$DEVICE" --dataset "$DS" \
+           --fraction "$FRACTION" --subject-fraction "$SF" $FORCE_FLAG
+    RESULTS="$(readlink -f "$EVAL_RESULTS_ROOT/_latest")"
+    "$PY" "$EVAL/classify.py" --results "$RESULTS" --tasks "$DSTASKS" $FORCE_FLAG
+    RUN_NAME="$(basename "$(dirname "$RESULTS")")"      # results/<run>/<dataset dir>
+    if [ "$EVAL_RESULTS_ROOT" != "$EVAL/results" ]; then
+      mkdir -p "$EVAL/results/$RUN_NAME"
+      rsync -a "$RESULTS" "$EVAL/results/$RUN_NAME/"   # publish to /data sequentially
+    fi
+    case " ${BATCH[*]:-} " in *" $RUN_NAME "*) ;; *) BATCH+=("$RUN_NAME") ;; esac
+  done
 done
 
-if [ "${#DIRS[@]}" -gt 1 ]; then
+echo ""
+echo "############################################################"
+echo "# figures + ranking (all cached checkpoints)"
+echo "############################################################"
+"$PY" "$EVAL/probe_plots.py"
+if [ "${#BATCH[@]}" -gt 0 ]; then
   echo ""
   echo "############################################################"
-  echo "# ALL RUNS — combined"
+  echo "# latest-batch figure (this invocation: ${BATCH[*]})"
   echo "############################################################"
-  for d in "${DIRS[@]}"; do echo ""; echo ">>> $(basename "$d")"; sed -n '/Accuracy per task/,$p' "$d/summary.txt"; done
+  "$PY" "$EVAL/probe_plots.py" --name latest "${BATCH[@]}"
 fi
 echo ""
-echo "done. per-run outputs in scripts/eval/results/<name>/ (summary.txt, accuracy.csv, bands.csv, plots/)"
+echo "done. results/<run>/ has the caches + card.png; results/_overview/ has probe_summary.png"
+echo "(all checkpoints) and probe_summary_latest.png (just this invocation's batch)"

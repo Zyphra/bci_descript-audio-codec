@@ -179,5 +179,4 @@ recons/
 scripts/eval/logs/*
 !scripts/eval/logs/.gitkeep
 scripts/eval/results/
-scripts/eval/.run.lock
 scripts/eval/__pycache__/

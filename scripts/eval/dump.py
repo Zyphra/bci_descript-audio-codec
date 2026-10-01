@@ -50,7 +50,9 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 from dac.model import DAC, DACFile  # noqa: E402
 
-EEGBCI = Path("/data/groups/bci/datasets/processed/v8_sets/classifier_eval/eegbci")
+DATASETS_ROOT = Path("/data/groups/bci/datasets/processed/v8_sets/classifier_eval")
+EEGBCI = DATASETS_ROOT / "eegbci"  # default dataset
+DATA_ROOT = EEGBCI
 SR = 256
 TARGET_STD = 0.3  # EEGNormalize defaults used in every training config
 CLIP = 1.0
@@ -67,14 +69,31 @@ def load_model(ckpt_path, device):
 
 
 def preprocess_file(path):
-    """Read one .fif, interpolate bads, bandpass -> (data[C, T] float32, ch_names)."""
+    """Read one .fif, interpolate bads, bandpass -> (data[C, T] float32, ch_names).
+
+    Concatenated files (SEED/SSVEP/BCICIV2a: trials or clips joined with 'BAD boundary'
+    annotations) are filtered PER SEGMENT: MNE's filter does not respect these custom
+    boundary annotations, so filtering the whole file smears energy across artificial
+    joins — confirmed by impulse test in external review. Genuine continuous recordings
+    (no boundary annotations) keep the identical whole-file filter as before.
+    """
     raw = mne.io.read_raw_fif(path, preload=True, verbose="error")
     raw.pick("eeg", verbose="error")
     if raw.info["bads"]:
         raw.interpolate_bads(reset_bads=True, verbose="error")
-    raw.filter(*BANDPASS, verbose="error")
     names = [n.rstrip(".").upper() for n in raw.ch_names]
-    return raw.get_data().astype(np.float32), names
+    sfreq = raw.info["sfreq"]
+    bounds = sorted({int(round(a["onset"] * sfreq)) for a in raw.annotations
+                     if "boundary" in a["description"].lower()})
+    if not bounds:
+        raw.filter(*BANDPASS, verbose="error")
+        return raw.get_data().astype(np.float32), names
+    data = raw.get_data()
+    edges = [0] + [b for b in bounds if 0 < b < data.shape[1]] + [data.shape[1]]
+    out = np.empty_like(data)
+    for a, b in zip(edges[:-1], edges[1:]):
+        out[:, a:b] = mne.filter.filter_data(data[:, a:b], sfreq, *BANDPASS, verbose="error")
+    return out.astype(np.float32), names
 
 
 def normalize(x):
@@ -133,7 +152,9 @@ def dump_task(df, task, model, kwargs, out_dir, device, limit, fraction, subject
     hop = int(np.prod(kwargs["encoder_rates"]))
     W = len(rows)
     lengths = (rows.duration_s * SR).round().astype(int).to_numpy()
-    Tmin, C = int(lengths.min()), 64
+    Tmin = int(lengths.min())
+    probe, _ = preprocess_file(DATA_ROOT / rows.path.iloc[0])
+    C = probe.shape[0]  # channels differ per dataset (eegbci 64, SEED 62, BCICIV2a 22)
     F = Tmin // hop
     cache_dir.mkdir(parents=True, exist_ok=True)
     mm = {
@@ -150,7 +171,7 @@ def dump_task(df, task, model, kwargs, out_dir, device, limit, fraction, subject
     cache_path, cache, ch_ref = None, None, None
     for i, r in enumerate(tqdm(list(rows.itertuples()), desc=f"codec {task}", unit="win")):
         if r.path != cache_path:
-            cache, names = preprocess_file(EEGBCI / r.path)
+            cache, names = preprocess_file(DATA_ROOT / r.path)
             cache_path = r.path
             if ch_ref is None:
                 ch_ref = names
@@ -204,24 +225,38 @@ def main():
     ap.add_argument("--limit", type=int, default=0, help="debug: only N windows per task")
     ap.add_argument("--force", action="store_true",
                     help="redo everything, replacing existing results for this model name")
+    ap.add_argument("--dataset", default="eegbci",
+                    help="classifier_eval dataset name (subfolder of v8_sets/classifier_eval)")
     ap.add_argument("--fraction", type=int, default=1,
                     help="keep every k-th window (quick checks); results get a _f<k> suffix")
     ap.add_argument("--subject-fraction", type=int, default=1,
                     help="keep every k-th subject with ALL their windows; _s<k> suffix")
     args = ap.parse_args()
 
+    global DATA_ROOT
+    DATA_ROOT = DATASETS_ROOT / args.dataset
     model, kwargs = load_model(args.ckpt, args.device)
     ckpt_id = hashlib.sha256(Path(args.ckpt).read_bytes()).hexdigest()[:8]
+    ds_prefix = "" if args.dataset == "eegbci" else f"{args.dataset}_"  # eegbci names stay cache-compatible
     name = args.name or (
-        f"{kwargs['n_codebooks']}x{kwargs['codebook_size']}"
+        ds_prefix
+        + f"{kwargs['n_codebooks']}x{kwargs['codebook_size']}"
         f"_hop{int(np.prod(kwargs['encoder_rates']))}_{ckpt_id}"
         + (f"_f{args.fraction}" if args.fraction > 1 else "")
         + (f"_s{args.subject_fraction}" if args.subject_fraction > 1 else "")
     )
     # Working root: node-local /scratch when the runner provides it (Lustre-weather-proof);
     # the runner rsyncs each finished checkpoint back to scripts/eval/results/.
+    # Layout: <root>/<training-run name>/<dataset+arch+hash dir> — one folder per run.
     root = Path(os.environ.get("EVAL_RESULTS_ROOT", Path(__file__).parent / "results"))
-    out_dir = root / name
+    ckpt_str = str(Path(args.ckpt).resolve())
+    if "runs/" in ckpt_str:
+        run = ckpt_str.split("runs/")[-1].split("/")[0]
+    elif ckpt_str.endswith("weights_snapshot.pth"):  # relaunched from results/<run>/<dir>/
+        run = Path(ckpt_str).parents[1].name
+    else:
+        run = "misc"
+    out_dir = root / run / name
     snap = out_dir / "weights_snapshot.pth"
     if snap.exists() and not filecmp.cmp(args.ckpt, snap, shallow=False):
         if args.force:
@@ -242,12 +277,12 @@ def main():
              **{str(q): model.quantizer.quantizers[q].codebook.weight.detach().cpu().numpy()
                 for q in range(kwargs["n_codebooks"])})
     (out_dir / "model_kwargs.json").write_text(json.dumps({"ckpt": str(args.ckpt), **kwargs}, indent=2))
-    latest = out_dir.parent / "_latest"
+    latest = root / "_latest"
     latest.unlink(missing_ok=True)
-    latest.symlink_to(out_dir.name)
+    latest.symlink_to(out_dir)
     print(f"model {name}  ->  {out_dir}")
 
-    df = pd.read_parquet(EEGBCI / "labels.parquet")
+    df = pd.read_parquet(DATA_ROOT / "labels.parquet")
     for task in args.tasks.split(","):
         dump_task(df, task.strip(), model, kwargs, out_dir, args.device,
                   args.limit, args.fraction, args.subject_fraction)
