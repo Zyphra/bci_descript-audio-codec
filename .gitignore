@@ -180,3 +180,4 @@ scripts/eval/logs/*
 !scripts/eval/logs/.gitkeep
 scripts/eval/results/
 scripts/eval/__pycache__/
+scripts/eval_codex/
