@@ -244,6 +244,14 @@ class MultiScaleSTFTLoss(nn.Module):
                 if self.phase_weight != 0:
                     loss += self.phase_weight * phase_loss
 
+        # Average across all scales - after loop.
+        n_windows = len(self.stft_params)
+        loss = loss / n_windows
+        components = {
+            name: value / n_windows 
+            for name, value in components.items()
+        }
+
         return (loss, components) if return_components else loss
 
 
@@ -343,6 +351,10 @@ class MelSpectrogramLoss(nn.Module):
                 y_mels.clamp(self.clamp_eps).pow(self.pow).log10(),
             )
             loss += self.mag_weight * self.loss_fn(x_mels, y_mels)
+
+        # Average across all scales - after loop.
+        loss = loss / len(self.stft_params)
+        
         return loss
 
 
