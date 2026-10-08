@@ -1036,6 +1036,26 @@ def train(
         "vq/codebook_loss": 1.0,
     },
 ):
+    allowed_loss_keys = {
+        "waveform/loss",
+        "mel/loss",
+        "stft/loss",
+        "stft/mag_loss",
+        "stft/log_mag_loss",
+        "stft/phase_loss",
+        "adv/gen_loss",
+        "adv/feat_loss",
+        "vq/commitment_loss",
+        "vq/codebook_loss",
+    }
+    # Reject unknown keys even when their weights are zero.
+    unknown = set(lambdas) - allowed_loss_keys
+    if unknown:
+        raise ValueError(
+            f"Unknown loss keys: {sorted(unknown)}. "
+            f"Keys are case-sensitive. Allowed: {sorted(allowed_loss_keys)}"
+        )
+
     util.seed(seed)
     Path(save_path).mkdir(exist_ok=True, parents=True)
     writer = (

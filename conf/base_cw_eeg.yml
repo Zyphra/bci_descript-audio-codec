@@ -1,7 +1,7 @@
 # Model setup
 DAC.sample_rate: 256                 # EEG: was 44100
 DAC.encoder_dim: 64
-DAC.encoder_rates: [2, 2, 2, 4]      # EEG: was [2, 4, 8, 8]; hop 16 -> 16 tokens/s (audio: hop 512 -> 86 tokens/s)
+DAC.encoder_rates: [2, 2, 2, 4]      # EEG: was [2, 4, 8, 8]; hop=32 -> 8 tokens/s (audio: hop 512 -> 86 tokens/s)
 DAC.decoder_dim: 1536
 DAC.decoder_rates: [4, 2, 2, 2]      # EEG: was [8, 8, 4, 2]
 
@@ -83,7 +83,7 @@ train/AudioDataset.n_examples: 10000000
 
 val/AudioDataset.duration: 5.0
 val/build_transform.augment_prob: 1.0
-val/AudioDataset.n_examples: 250
+val/AudioDataset.n_examples: 250 # 10000 assignments per validation
 
 test/AudioDataset.duration: 10.0
 test/build_transform.augment_prob: 1.0
