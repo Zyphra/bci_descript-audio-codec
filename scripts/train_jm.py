@@ -2,7 +2,7 @@
 # Run this script with: 
 
 CUDA_VISIBLE_DEVICES=1 python scripts/train_jm.py --args.load conf/base_jm_eeg.yml
-CUDA_VISIBLE_DEVICES=4 python scripts/train_jm.py --args.load conf/base_jm_eeg.yml
+CUDA_VISIBLE_DEVICES=3 python scripts/train_jm.py --args.load conf/base_eg.yml
 
 
 CUDA_VISIBLE_DEVICES=4 python scripts/train_jm.py \
