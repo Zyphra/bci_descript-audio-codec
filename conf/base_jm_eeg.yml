@@ -6,8 +6,8 @@ DAC.decoder_dim: 1536
 DAC.decoder_rates: [4, 2, 2, 2]      # EEG: was [8, 8, 4, 2]
 
 # Quantization
-DAC.n_codebooks: 9
-DAC.codebook_size: 1024 #1024
+DAC.n_codebooks: 1
+DAC.codebook_size: 8192       # chris ballpark 2026-10-09 (was 9x1024)
 DAC.codebook_dim: 8
 DAC.quantizer_dropout: 0.0 # 1.0
 
@@ -35,15 +35,17 @@ num_iters: 20000 #250000
 save_iters: [1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000] #[10000, 50000, 100000, 200000]
 valid_freq: 1000
 sample_freq: 1000 #10000
-num_workers: 32
+num_workers: 16  # 32 loaders hammer Lustre; 16 matches chris's runs
 val_idx: [0, 1, 2, 3, 4, 5, 6, 7]
 seed: 0
+# chris ballpark 2026-10-09: Wav=15, STFT=2 (mag=1, log=0.03), VQ comm=0.25 code=1,
+# no adversarial yet (he is still experimenting with adding it)
 lambdas:
   mel/loss: 0.0 # 15.0
-  stft/loss: 15.0 # 0.0     # default to 0.0, not in DAC for audio
-  waveform/loss: 15.0 #0.0 # default to 0.0, not in DAC for audio
-  adv/feat_loss:  2.0
-  adv/gen_loss: 1.0
+  stft/loss: 2.0 # was 15.0
+  waveform/loss: 15.0
+  adv/feat_loss: 0.0 # 2.0
+  adv/gen_loss: 0.0 # 1.0
   vq/commitment_loss: 0.25
   vq/codebook_loss: 1.0
 
@@ -209,7 +211,9 @@ build_transform.postprocess: # postprocessing that's ALWAYS applied to the audio
   # SpectralDenoising.prob: 1.0
 
 # Loss setup
-MultiScaleSTFTLoss.window_lengths: [2048, 512]
+MultiScaleSTFTLoss.window_lengths: [256, 64]   # EEG-scale (chris); [2048, 512] = audio-scale, longer than a 1280-sample clip
+MultiScaleSTFTLoss.mag_weight: 1.0
+MultiScaleSTFTLoss.log_weight: 0.03
 MelSpectrogramLoss.n_mels: [5, 10, 20, 40, 80, 160, 320]
 MelSpectrogramLoss.window_lengths: [32, 64, 128, 256, 512, 1024, 2048]
 MelSpectrogramLoss.mel_fmin: [0, 0, 0, 0, 0, 0, 0]
