@@ -57,14 +57,17 @@ build_transform.preprocess: # preprocessing that's ALWAYS applied to the audio b
 EEGNormalize.target_std: 0.3
 EEGNormalize.clip: 1.0
 EEGNormalize.prob: 1.0
-build_transform.augment_prob: 0.0
-build_transform.augment: # augmentation that's applied to the audio with probability augment_prob
+# Two augmentation regimes (see train_jm.py train_loop):
+#   augment     -> applied to input AND reconstruction target: the codec must
+#                  REPRESENT these (coverage, e.g. filter diversity across labs)
+#   postprocess -> applied to the INPUT ONLY, target stays clean: the codec must
+#                  DISCARD these (invariance, e.g. gain jitter, sensor noise)
+# With Identity in both, training is byte-identical to the old behaviour.
+build_transform.augment_prob: 1.0   # gates the whole coverage stage; per-transform .prob below
+build_transform.augment:
   - Identity
-build_transform.postprocess: # postprocessing that's ALWAYS applied to the audio after any augmentat
+build_transform.postprocess:
   - Identity
-  # - VolumeNorm
-  # - RescaleAudio
-  # - ShiftPhase
 
   # All possible options below
 

@@ -470,6 +470,10 @@ def val_loop(batch, state, accel, codebook_counts=None):
     signal = state.val_data.transform(
         batch["signal"].clone(), **batch["transform_args"]
     )
+    with state.val_data.transform.filter("preprocess", "augment"):
+        target = state.val_data.transform(
+            batch["signal"].clone(), **batch["transform_args"]
+        )
 
     out = state.generator(signal.audio_data, signal.sample_rate)
     recons = AudioSignal(out["audio"], signal.sample_rate)
@@ -477,11 +481,11 @@ def val_loop(batch, state, accel, codebook_counts=None):
     if codebook_counts is not None:
         accumulate_codebook_counts(codebook_counts, out["codes"])
 
-    stft_loss, stft_components = state.stft_loss(recons, signal, return_components=True)
-    waveform_loss = state.waveform_loss(recons, signal)
+    stft_loss, stft_components = state.stft_loss(recons, target, return_components=True)
+    waveform_loss = state.waveform_loss(recons, target)
     return {
         "loss": waveform_loss + stft_loss,
-        "mel/loss": state.mel_loss(recons, signal),
+        "mel/loss": state.mel_loss(recons, target),
         "stft/loss": stft_loss,
         **{f"stft/{name}_loss": value for name, value in stft_components.items()},
         "waveform/loss": waveform_loss,
@@ -500,9 +504,20 @@ def train_loop(state, batch, accel, lambdas, codebook_counts=None, gradient_diag
 
     batch = util.prepare_batch(batch, accel.device)
     with torch.no_grad():
+        # INPUT = full transform chain; TARGET excludes the "postprocess" stage.
+        # Transforms configured under `postprocess` therefore corrupt only the
+        # input, training the codec to be INVARIANT to them (gain jitter, noise);
+        # transforms under `augment` land in input AND target, so the codec must
+        # REPRESENT them (filter diversity). Identical transform_args -> shared
+        # stages draw identical random parameters in both calls. With the default
+        # postprocess=[Identity], target == signal (original behaviour).
         signal = state.train_data.transform(
             batch["signal"].clone(), **batch["transform_args"]
         )
+        with state.train_data.transform.filter("preprocess", "augment"):
+            target = state.train_data.transform(
+                batch["signal"].clone(), **batch["transform_args"]
+            )
 
     with accel.autocast():
         out = state.generator(signal.audio_data, signal.sample_rate)
@@ -532,7 +547,7 @@ def train_loop(state, batch, accel, lambdas, codebook_counts=None, gradient_diag
     discriminator_sample = None
     if state.use_gan:
         with accel.autocast():
-            output["adv/disc_loss"] = state.gan_loss.discriminator_loss(recons, signal)
+            output["adv/disc_loss"] = state.gan_loss.discriminator_loss(recons, target)
 
         state.optimizer_d.zero_grad()
         accel.backward(output["adv/disc_loss"])
@@ -547,16 +562,16 @@ def train_loop(state, batch, accel, lambdas, codebook_counts=None, gradient_diag
 
     with accel.autocast():
         output["stft/loss"], stft_components = state.stft_loss(
-            recons, signal, return_components=True
+            recons, target, return_components=True
         )
         output.update({f"stft/{name}_loss": value for name, value in stft_components.items()})
-        output["mel/loss"] = state.mel_loss(recons, signal)
-        output["waveform/loss"] = state.waveform_loss(recons, signal)
+        output["mel/loss"] = state.mel_loss(recons, target)
+        output["waveform/loss"] = state.waveform_loss(recons, target)
         if state.use_gan:
             (
                 output["adv/gen_loss"],
                 output["adv/feat_loss"],
-            ) = state.gan_loss.generator_loss(recons, signal)
+            ) = state.gan_loss.generator_loss(recons, target)
         output["vq/commitment_loss"] = commitment_loss
         output["vq/codebook_loss"] = codebook_loss
         output["loss"] = sum([v * output[k] for k, v in lambdas.items() if k in output])
