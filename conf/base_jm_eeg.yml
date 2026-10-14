@@ -51,23 +51,63 @@ lambdas:
 
 # VolumeNorm.db: [const, -16]
 
-# Transforms
-build_transform.preprocess: # preprocessing that's ALWAYS applied to the audio before any augmentation
+# Transforms: preprocess -> augment -> corrupt -> postprocess   (train_jm.py build_transform)
+#   model INPUT  = all four stages
+#   loss TARGET  = the same chain with `corrupt` skipped (same random draws)
+#   preprocess / postprocess : always on, both arms (normalization; the second
+#                              normalize re-standardizes the corrupted input)
+#   augment                  : random, both arms -> codec must REPRESENT (coverage)
+#   corrupt                  : random, input only -> codec must REMOVE (invariance)
+# Every stage list needs at least one entry (use Identity): an all-commented list
+# parses as null and crashes build_transform.
+build_transform.preprocess:
   - EEGNormalize
 EEGNormalize.target_std: 0.3
 EEGNormalize.clip: 1.0
 EEGNormalize.prob: 1.0
-# Two augmentation regimes (see train_jm.py train_loop):
-#   augment     -> applied to input AND reconstruction target: the codec must
-#                  REPRESENT these (coverage, e.g. filter diversity across labs)
-#   postprocess -> applied to the INPUT ONLY, target stays clean: the codec must
-#                  DISCARD these (invariance, e.g. gain jitter, sensor noise)
-# With Identity in both, training is byte-identical to the old behaviour.
+
 build_transform.augment_prob: 1.0   # gates the whole coverage stage; per-transform .prob below
 build_transform.augment:
   - Identity
-build_transform.postprocess:
-  - Identity
+  # - HighPass            # lab-style high-pass diversity
+  # - LowPass             # lab-style low-pass diversity
+  # - FrequencyMask       # pre-notched data (60 Hz)
+  # - Equalizer           # mild spectral tilts
+HighPass.cutoff: [choice, [0.1, 0.5, 1.0]]
+HighPass.zeros: 51
+HighPass.prob: 0.3
+LowPass.cutoff: [choice, [40, 45]]   # keep >= 40: lower cutoffs delete beta/SSVEP content
+LowPass.zeros: 51
+LowPass.prob: 0.3
+FrequencyMask.f_center: [const, 0.469]  # 60/128 Hz
+FrequencyMask.f_width: [const, 0.03]
+FrequencyMask.prob: 0.5
+Equalizer.eq_amount: [const, 0.5]
+Equalizer.n_bands: 6
+Equalizer.prob: 0.5
+
+build_transform.corrupt_prob: 0.5   # 50% of windows get corrupted at all; then per-transform .prob below
+build_transform.corrupt:
+  - NoiseFloor          # gaussian sensor noise: codec must denoise
+  - FrequencyNoise      # 60 Hz line noise: codec must remove it
+  - TimeNoise           # noise burst in a random time segment
+  # - ClippingDistortion  # amplifier saturation: codec must de-clip
+  # (VolumeChange is a no-op here: the postprocess normalize undoes any gain)
+NoiseFloor.db: [uniform, -95.0, -75.0]  # around the -85 dB EEG-calibrated level
+NoiseFloor.prob: 0.5
+FrequencyNoise.f_center: [const, 0.469] # 60 Hz as fraction of Nyquist (60/128)
+FrequencyNoise.f_width: [const, 0.03]   # ~4 Hz wide
+FrequencyNoise.prob: 0.5
+ClippingDistortion.perc: [uniform, 0.0, 0.05]
+ClippingDistortion.prob: 0.5
+TimeNoise.t_center: [uniform, 0.0, 1.0]
+TimeNoise.t_width: [const, 0.1]         # 10% of the window
+TimeNoise.prob: 0.5
+VolumeChange.db: [uniform, -6.0, 0.0]
+VolumeChange.prob: 0.5
+
+build_transform.postprocess:         # both arms, after corruption: canonical scale in, canonical scale out
+  - EEGNormalize
 
   # All possible options below
 
@@ -243,11 +283,11 @@ AudioLoader.EEG: true #jm
 AudioDataset.without_replacement: true
 
 train/build_dataset.folders:         # EEG: was EARS
-  alice:
+  rand10k:
     - /data/groups/bci/datasets/processed/v8_sets/10k/train
 
 val/build_dataset.folders:
-  alice:
+  rand10k:
     - /data/groups/bci/datasets/processed/v8_sets/10k/val
 
 # test/build_dataset.folders:

@@ -313,15 +313,26 @@ def get_infinite_loader(dataloader):
 @argbind.bind("train", "val")
 def build_transform(
     augment_prob: float = 1.0,
+    corrupt_prob: float = 1.0,
     preprocess: list = ["Identity"],
     augment: list = ["Identity"],
+    corrupt: list = ["Identity"],
     postprocess: list = ["Identity"],
 ):
+    """preprocess -> augment -> corrupt -> postprocess.
+
+    All stages feed the model INPUT; the loss TARGET is the same chain with
+    `corrupt` skipped (see train_loop). So: preprocess/postprocess = always-on
+    conditioning on both arms (e.g. EEGNormalize), augment = random variation the
+    codec must REPRESENT (both arms), corrupt = input-only damage the codec must
+    REMOVE (invariance: noise, line hum, clipping).
+    """
     to_tfm = lambda l: [getattr(tfm, x)() for x in l]
     preprocess = transforms.Compose(*to_tfm(preprocess), name="preprocess")
     augment = transforms.Compose(*to_tfm(augment), name="augment", prob=augment_prob)
+    corrupt = transforms.Compose(*to_tfm(corrupt), name="corrupt", prob=corrupt_prob)
     postprocess = transforms.Compose(*to_tfm(postprocess), name="postprocess")
-    transform = transforms.Compose(preprocess, augment, postprocess)
+    transform = transforms.Compose(preprocess, augment, corrupt, postprocess)
     return transform
 
 
@@ -470,7 +481,7 @@ def val_loop(batch, state, accel, codebook_counts=None):
     signal = state.val_data.transform(
         batch["signal"].clone(), **batch["transform_args"]
     )
-    with state.val_data.transform.filter("preprocess", "augment"):
+    with state.val_data.transform.filter("preprocess", "augment", "postprocess"):
         target = state.val_data.transform(
             batch["signal"].clone(), **batch["transform_args"]
         )
@@ -504,17 +515,18 @@ def train_loop(state, batch, accel, lambdas, codebook_counts=None, gradient_diag
 
     batch = util.prepare_batch(batch, accel.device)
     with torch.no_grad():
-        # INPUT = full transform chain; TARGET excludes the "postprocess" stage.
-        # Transforms configured under `postprocess` therefore corrupt only the
-        # input, training the codec to be INVARIANT to them (gain jitter, noise);
+        # INPUT = full transform chain; TARGET = the same chain with the `corrupt`
+        # stage skipped. Transforms under `corrupt` therefore damage only the input,
+        # training the codec to be INVARIANT to them (noise, line hum, clipping);
         # transforms under `augment` land in input AND target, so the codec must
-        # REPRESENT them (filter diversity). Identical transform_args -> shared
-        # stages draw identical random parameters in both calls. With the default
-        # postprocess=[Identity], target == signal (original behaviour).
+        # REPRESENT them (filter diversity); `postprocess` (e.g. EEGNormalize) runs
+        # on both arms AFTER corruption, so inputs always arrive in canonical scale.
+        # Identical transform_args -> shared stages draw identical random parameters
+        # in both calls. With corrupt=[Identity], target == signal (plain DAC).
         signal = state.train_data.transform(
             batch["signal"].clone(), **batch["transform_args"]
         )
-        with state.train_data.transform.filter("preprocess", "augment"):
+        with state.train_data.transform.filter("preprocess", "augment", "postprocess"):
             target = state.train_data.transform(
                 batch["signal"].clone(), **batch["transform_args"]
             )
