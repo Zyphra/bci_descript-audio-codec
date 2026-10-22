@@ -25,6 +25,8 @@ from typing import Optional
 
 import argbind
 import torch
+import numpy as np
+import torch.nn.functional as F
 from audiotools import AudioSignal
 from audiotools import ml
 from audiotools.core import util
@@ -297,6 +299,157 @@ filter_fn = lambda fn: hasattr(fn, "transform") and fn.__qualname__ not in [
     "Compose",
     "Choose",
 ]
+# EEG variants of the STFT-domain band transforms (FrequencyMask / FrequencyNoise).
+# Three fixes in one (all verified 2026-10-19):
+#  1. The stock transforms only edit `stft_data` (mask_frequencies documents "apply
+#     .istft() to get the masked audio") and never call istft -> the WAVEFORM the
+#     model trains on is untouched: a silent no-op. These variants istft back.
+#  2. audiotools gives 256 Hz signals a 16-sample STFT (16 Hz bins); a few-Hz band
+#     at 50/60 Hz would contain no bin. These variants use a 256-sample STFT
+#     (1 Hz bins) and restore the signal's own params afterwards.
+#  3. argbind configures transforms per CLASS, so two notches at different line
+#     frequencies need two class names, each with its OWN __init__ (a subclass
+#     that merely inherits __init__ silently reads the parent's args).
+from audiotools import STFTParams
+_EEG_STFT = STFTParams(window_length=256, hop_length=64, window_type="hann")
+
+
+def _eeg_band_class(name, base):
+    def __init__(self, f_center: tuple = ("uniform", 0.0, 1.0),
+                 f_width: tuple = ("const", 0.1), name: str = None, prob: float = 1.0):
+        base.__init__(self, f_center=f_center, f_width=f_width, name=name, prob=prob)
+
+    def transform(self, signal, **kwargs):
+        # SpectralTransform.transform does stft -> _transform -> istft with the
+        # signal's own params; swap in the EEG params for the whole round trip.
+        old = signal.stft_params
+        signal.stft_params = _EEG_STFT
+        signal.stft_data = None
+        try:
+            return base.transform(self, signal, **kwargs)
+        finally:
+            signal.stft_params = old
+            signal.stft_data = None
+
+    def _transform(self, signal, **kwargs):
+        signal.stft_params = _EEG_STFT               # the masked slice must match
+        return base._transform(self, signal, **kwargs)
+
+    cls = type(name, (base,), {"__init__": __init__, "transform": transform, "_transform": _transform})
+    cls.__init__.__qualname__ = f"{name}.__init__"
+    return cls
+
+
+transforms.FrequencyMask50 = _eeg_band_class("FrequencyMask50", transforms.FrequencyMask)
+transforms.FrequencyMask60 = _eeg_band_class("FrequencyMask60", transforms.FrequencyMask)
+transforms.FrequencyNoise60 = _eeg_band_class("FrequencyNoise60", transforms.FrequencyNoise)
+
+
+class LineNoise(transforms.BaseTransform):
+    """ADD mains hum: a sinusoid at `freq_hz` with random phase, at `level_db`
+    relative to the signal's RMS (0 dB = hum as loud as the EEG). Time-domain,
+    so it works at any sample rate. (audiotools' FrequencyNoise *replaces* a band
+    with unit-scale STFT noise, which is far below real hum levels.)"""
+
+    def __init__(self, level_db: tuple = ("uniform", -30.0, -10.0), freq_hz: float = 60.0,
+                 freq_jitter_hz: float = 0.0, name: str = None, prob: float = 1.0):
+        super().__init__(name=name, prob=prob)
+        self.level_db = level_db
+        self.freq_hz = freq_hz
+        self.freq_jitter_hz = freq_jitter_hz   # jm 2026-10-20: hum frequency drawn from freq_hz +- jitter per window
+
+    def _instantiate(self, state):
+        return {"level_db": util.sample_from_dist(self.level_db, state),
+                "phase": float(state.uniform(0.0, 2 * np.pi)),
+                "freq_hz": float(self.freq_hz + state.uniform(-self.freq_jitter_hz, self.freq_jitter_hz))}
+
+    def _transform(self, signal, level_db, phase, freq_hz=None):
+        x = signal.audio_data                                        # [B, C, T]
+        t = torch.arange(x.shape[-1], device=x.device, dtype=x.dtype) / signal.sample_rate
+        rms = x.pow(2).mean(-1, keepdim=True).sqrt()
+        level_db = torch.as_tensor(level_db, device=x.device, dtype=x.dtype).view(-1, 1, 1)
+        phase = torch.as_tensor(phase, device=x.device, dtype=x.dtype).view(-1, 1, 1)
+        freq = (torch.as_tensor(freq_hz, device=x.device, dtype=x.dtype).view(-1, 1, 1)
+                if freq_hz is not None else torch.tensor(self.freq_hz, device=x.device, dtype=x.dtype))
+        amp = rms * (2 ** 0.5) * 10 ** (level_db / 20)
+        signal.audio_data = x + amp * torch.sin(2 * np.pi * freq * t + phase)
+        return signal
+
+
+class GaussianNoise(transforms.BaseTransform):
+    """ADD white gaussian noise at a given SNR (dB) relative to each window's power
+    (0 dB = noise as strong as the EEG). Defined by SNR so that a training level is
+    directly comparable with the stress-test levels of code_consistency_jm (30 .. 0 dB);
+    audiotools' NoiseFloor is specified in loudness dB and its SNR depends on the window.
+    (jm, 2026-10-20, noise sweep)"""
+
+    def __init__(self, snr_db: tuple = ("uniform", 10.0, 30.0), name: str = None, prob: float = 1.0):
+        super().__init__(name=name, prob=prob)
+        self.snr_db = snr_db
+
+    def _instantiate(self, state, signal=None):
+        return {"snr_db": util.sample_from_dist(self.snr_db, state)}
+
+    def _transform(self, signal, snr_db):
+        x = signal.audio_data                                        # [B, C, T]
+        power = x.pow(2).mean(-1, keepdim=True)
+        snr_db = torch.as_tensor(snr_db, device=x.device, dtype=x.dtype).view(-1, 1, 1)
+        noise = torch.randn_like(x) * (power * 10 ** (-snr_db / 10)).sqrt()
+        signal.audio_data = x + noise
+        return signal
+
+
+transforms.GaussianNoise = GaussianNoise
+transforms.LineNoise60 = type("LineNoise60", (LineNoise,), {})
+transforms.LineNoise60.__init__ = LineNoise.__init__  # own __init__ for argbind (see above)
+
+
+CONSISTENCY_TAU = 0.1   # softmax temperature over code cosine similarities
+
+
+@torch.no_grad()
+def _clean_branch(model, target):
+    """Teacher: encode the CLEAN target (no gradient) -> its codes and pre-quantization
+    latents, the same quantities `out` carries for the corrupted input."""
+    z, codes, latents, _, _ = model.encode(target.audio_data)
+    return codes, latents
+
+
+def consistency_losses(model, out, target, corrupted=None):
+    """Key-consistency objective (jm, 2026-10-19): make the corrupted input's tokens
+    match the clean input's tokens, not just its reconstruction.
+      consistency/code_loss   cross-entropy of the corrupted frame's soft code assignment
+                              (softmax of cosine-to-codebook / tau) against the CLEAN key
+      consistency/latent_loss MSE between corrupted and clean pre-quantization latents
+      consistency/usage_loss  KL(mean soft assignment over the batch || uniform)
+                              = log V - H(mean softmax): keeps the codebook in use.
+    Both teacher terms use the clean branch as a stop-gradient teacher and are averaged
+    over the CORRUPTED windows only (`corrupted`: [B] bool, input != target). Without the
+    usage term and the mask the CE collapses every frame onto one code (sweep-5
+    consist_lo/hi/code: codebook usage 1e-2..1e-4, val stft 0.47..0.80)."""
+    codes_clean, lat_clean = _clean_branch(model, target)
+    lat = out["latents"]                              # [B, Q*D, T], with gradient
+    B = lat.shape[0]
+    if corrupted is None:
+        corrupted = torch.ones(B, dtype=torch.bool, device=lat.device)
+    w = corrupted.float() / corrupted.float().sum().clamp(min=1.0)   # [B], sums to 1 (or 0)
+    latent_loss = (F.mse_loss(lat, lat_clean, reduction="none").mean((1, 2)) * w).sum()
+    code_loss, usage_loss, D = 0.0, 0.0, model.quantizer.quantizers[0].codebook_dim
+    for q, vq in enumerate(model.quantizer.quantizers[: out["codes"].shape[1]]):
+        e = F.normalize(lat[:, q * D:(q + 1) * D], dim=1)             # [B, D, T]
+        c = F.normalize(vq.codebook.weight, dim=1)                   # [V, D]
+        logits = torch.einsum("bdt,vd->btv", e, c) / CONSISTENCY_TAU  # cosine / tau, [B, T, V]
+        V = logits.shape[-1]
+        ce = F.cross_entropy(logits.reshape(-1, V), codes_clean[:, q].reshape(-1),
+                             reduction="none").view(B, -1).mean(1)   # [B]
+        code_loss = code_loss + (ce * w).sum()
+        p_mean = logits.float().softmax(-1).reshape(-1, V).mean(0)   # marginal assignment, all windows
+        usage_loss = usage_loss + math.log(V) + (p_mean * (p_mean + 1e-12).log()).sum()
+        with torch.no_grad():
+            same = (out["codes"][:, q] == codes_clean[:, q]).float().mean()
+    return {"consistency/code_loss": code_loss, "consistency/latent_loss": latent_loss,
+            "consistency/usage_loss": usage_loss, "consistency/key_agreement": same,
+            "consistency/corrupted_frac": corrupted.float().mean()}
 tfm = argbind.bind_module(transforms, "train", "val", filter_fn=filter_fn)
 
 # Loss
@@ -314,9 +467,10 @@ def get_infinite_loader(dataloader):
 def build_transform(
     augment_prob: float = 1.0,
     corrupt_prob: float = 1.0,
+    corrupt_choose: bool = False,  # True: pick exactly one corruption per window
     preprocess: list = ["Identity"],
     augment: list = ["Identity"],
-    corrupt: list = ["Identity"],
+    corrupt: list = ["Identity"], #JM: augment that is only applied to the input, not the target
     postprocess: list = ["Identity"],
 ):
     """preprocess -> augment -> corrupt -> postprocess.
@@ -330,7 +484,10 @@ def build_transform(
     to_tfm = lambda l: [getattr(tfm, x)() for x in l]
     preprocess = transforms.Compose(*to_tfm(preprocess), name="preprocess")
     augment = transforms.Compose(*to_tfm(augment), name="augment", prob=augment_prob)
-    corrupt = transforms.Compose(*to_tfm(corrupt), name="corrupt", prob=corrupt_prob)
+    # Compose: every listed corruption fires independently at its own .prob;
+    # Choose: exactly one of them is picked per window.
+    corrupt_cls = transforms.Choose if corrupt_choose else transforms.Compose
+    corrupt = corrupt_cls(*to_tfm(corrupt), name="corrupt", prob=corrupt_prob)
     postprocess = transforms.Compose(*to_tfm(postprocess), name="postprocess")
     transform = transforms.Compose(preprocess, augment, corrupt, postprocess)
     return transform
@@ -526,7 +683,7 @@ def train_loop(state, batch, accel, lambdas, codebook_counts=None, gradient_diag
         signal = state.train_data.transform(
             batch["signal"].clone(), **batch["transform_args"]
         )
-        with state.train_data.transform.filter("preprocess", "augment", "postprocess"):
+        with state.train_data.transform.filter("preprocess", "augment", "postprocess"): #JM: corrupt is skipped for the target
             target = state.train_data.transform(
                 batch["signal"].clone(), **batch["transform_args"]
             )
@@ -586,6 +743,9 @@ def train_loop(state, batch, accel, lambdas, codebook_counts=None, gradient_diag
             ) = state.gan_loss.generator_loss(recons, target)
         output["vq/commitment_loss"] = commitment_loss
         output["vq/codebook_loss"] = codebook_loss
+        if any(lambdas.get(k, 0) for k in ("consistency/code_loss", "consistency/latent_loss", "consistency/usage_loss")):
+            corrupted = (signal.audio_data != target.audio_data).flatten(1).any(1)   # [B]: did a corruption fire?
+            output.update(consistency_losses(accel.unwrap(state.generator), out, target, corrupted))
         output["loss"] = sum([v * output[k] for k, v in lambdas.items() if k in output])
 
     state.optimizer_g.zero_grad()
@@ -742,6 +902,76 @@ def reconstruction_due(completed_steps, save_iters, sample_freq, last_iter):
             or (sample_freq > 0 and completed_steps % sample_freq == 0))
 
 
+STAGES = ("preprocess", "augment", "corrupt", "postprocess")
+
+
+@torch.no_grad()
+def transform_stage_figure(state, idx, seconds=2.0):
+    """One TRAINING window replayed stage by stage: raw -> +preprocess -> +augment
+    -> +corrupt -> +postprocess (= model input). Left: waveform (first `seconds`),
+    right: log power spectrum. The transform_args carry the random draw, so every
+    stage is the exact signal the model saw for that draw (corrupt is what the
+    loss target skips)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    batch = state.train_data.collate([state.train_data[idx]])
+    batch = util.prepare_batch(batch, accel.device)
+    sr = batch["signal"].sample_rate
+    stages = [("raw", batch["signal"].audio_data[0, 0].float().cpu().numpy())]
+    for k in range(1, len(STAGES) + 1):
+        with state.train_data.transform.filter(*STAGES[:k]):
+            sig = state.train_data.transform(batch["signal"].clone(), **batch["transform_args"])
+        stages.append((f"+{STAGES[k - 1]}", sig.audio_data[0, 0].float().cpu().numpy()))
+
+    # which transforms fired in this draw: audiotools keys the args as
+    # "<i>.<stage>" -> {"<j>.<Transform>": {..., "mask"}, "mask": stage gate}
+    def _on(d):
+        m = d.get("mask") if isinstance(d, dict) else None
+        return m is not None and bool(torch.as_tensor(m).flatten()[0])
+    fired = {}
+
+    def _walk(d):  # stage dicts sit under the outer Compose; depth may vary
+        for key, val in d.items():
+            if not isinstance(val, dict):
+                continue
+            name = key.split(".", 1)[-1]
+            if name in STAGES:
+                fired[name] = [tk.split(".", 1)[-1] for tk, ta in val.items()
+                               if isinstance(ta, dict) and tk.split(".", 1)[-1] != "Identity"
+                               and _on(ta)] if _on(val) else []
+            else:
+                _walk(val)
+    _walk(batch["transform_args"])
+
+    n = int(seconds * sr)
+    fig, axes = plt.subplots(len(stages), 2, figsize=(14, 2.1 * len(stages)),
+                             gridspec_kw={"width_ratios": [2.2, 1]})
+    t = np.arange(n) / sr
+    for (name, x), (ax_t, ax_f) in zip(stages, axes):
+        ax_t.plot(t, x[:n], linewidth=0.6, color="#0072B2")
+        label = name
+        if name.startswith("+"):
+            f = fired.get(name[1:], [])
+            label += "\n(" + (", ".join(f) if f else "nothing fired") + ")"
+        ax_t.set_ylabel(label, rotation=0, ha="right", va="center", fontsize=9)
+        ax_t.set_xlim(0, seconds)
+        spec = np.abs(np.fft.rfft(x * np.hanning(len(x)))) ** 2
+        f = np.fft.rfftfreq(len(x), 1 / sr)
+        ax_f.semilogy(f, spec + 1e-12, linewidth=0.6, color="#D55E00")
+        ax_f.set_xlim(0, sr / 2)
+        for ax in (ax_t, ax_f):
+            ax.tick_params(labelsize=7)
+    axes[-1, 0].set_xlabel("time (s)", fontsize=9)
+    axes[-1, 1].set_xlabel("frequency (Hz)", fontsize=9)
+    fig.suptitle(f"Transform stages, training sample {idx} (left: waveform, right: power spectrum)",
+                 fontsize=11)
+    fig.tight_layout()
+    return fig
+
+
 @torch.no_grad()
 def save_samples(state, val_idx, writer, wandb=None, wandb_run=None,
                  save_path=None, stft_window_length=256):
@@ -801,6 +1031,20 @@ def save_samples(state, val_idx, writer, wandb=None, wandb_run=None,
                                           global_step=completed_steps, close=False)
                 finally:
                     figure.clear()
+        # the augmentation pipeline itself, stage by stage — logged ONCE (first sample
+        # step; it does not depend on the model), four windows to show the variety of draws
+        for idx in (range(4) if state.tracker.step == 0 else ()):
+            figure = transform_stage_figure(state, idx)
+            try:
+                path = output / f"transform_stages_{idx}.png"
+                figure.savefig(path, dpi=130)
+                plots[f"transform_stages/sample_{idx}"] = wandb.Image(
+                    str(path), caption=f"raw -> preprocess -> augment -> corrupt -> postprocess, "
+                                       f"iteration {completed_steps}")
+            finally:
+                figure.clear()
+                import matplotlib.pyplot as plt
+                plt.close(figure)
         wandb_run.log(plots)
 
 
@@ -1068,6 +1312,7 @@ def train(
     },
 ):
     allowed_loss_keys = {
+        "consistency/code_loss", "consistency/latent_loss", "consistency/usage_loss",   # jm key-consistency terms
         "waveform/loss",
         "mel/loss",
         "stft/loss",

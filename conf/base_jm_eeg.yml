@@ -67,37 +67,43 @@ EEGNormalize.clip: 1.0
 EEGNormalize.prob: 1.0
 
 build_transform.augment_prob: 1.0   # gates the whole coverage stage; per-transform .prob below
-build_transform.augment:
-  - Identity
-  # - HighPass            # lab-style high-pass diversity
-  # - LowPass             # lab-style low-pass diversity
-  # - FrequencyMask       # pre-notched data (60 Hz)
-  # - Equalizer           # mild spectral tilts
-HighPass.cutoff: [choice, [0.1, 0.5, 1.0]]
-HighPass.zeros: 51
-HighPass.prob: 0.3
-LowPass.cutoff: [choice, [40, 45]]   # keep >= 40: lower cutoffs delete beta/SSVEP content
+build_transform.augment:            # each fires independently -> any combination can occur
+  - FrequencyMask50     # 50 Hz notch (EU mains), p=.5
+  - FrequencyMask60     # 60 Hz notch (US mains), p=.5
+  - LowPass             # lab-style low-pass, p=.5, cutoff drawn from 30..60 Hz
+  - HighPass            # 1 Hz high-pass, p=.1
+  # - Equalizer         # mild spectral tilts
+FrequencyMask50.f_center: [const, 0.3906]  # 50/128 Hz
+FrequencyMask50.f_width: [const, 0.03]     # ~4 Hz wide
+FrequencyMask50.prob: 0.5
+FrequencyMask60.f_center: [const, 0.469]   # 60/128 Hz
+FrequencyMask60.f_width: [const, 0.03]
+FrequencyMask60.prob: 0.5
+LowPass.cutoff: [choice, [30, 35, 40, 45, 50, 55, 60]]
 LowPass.zeros: 51
-LowPass.prob: 0.3
-FrequencyMask.f_center: [const, 0.469]  # 60/128 Hz
-FrequencyMask.f_width: [const, 0.03]
-FrequencyMask.prob: 0.5
+LowPass.prob: 0.5
+HighPass.cutoff: [const, 1.0]
+HighPass.zeros: 51
+HighPass.prob: 0.1
 Equalizer.eq_amount: [const, 0.5]
 Equalizer.n_bands: 6
 Equalizer.prob: 0.5
 
 build_transform.corrupt_prob: 0.5   # 50% of windows get corrupted at all; then per-transform .prob below
+build_transform.corrupt_choose: false  # false: each fires independently (0..4 at once); true: exactly one
 build_transform.corrupt:
   - NoiseFloor          # gaussian sensor noise: codec must denoise
-  - FrequencyNoise      # 60 Hz line noise: codec must remove it
+  - LineNoise60         # ADDS 60 Hz mains hum (time-domain sinusoid): codec must remove it
+                        #   (stock FrequencyNoise was a silent no-op; its EEG variant only
+                        #   notches - see train_jm.py)
   - TimeNoise           # noise burst in a random time segment
-  # - ClippingDistortion  # amplifier saturation: codec must de-clip
+  - ClippingDistortion  # amplifier saturation: codec must de-clip
   # (VolumeChange is a no-op here: the postprocess normalize undoes any gain)
 NoiseFloor.db: [uniform, -95.0, -75.0]  # around the -85 dB EEG-calibrated level
 NoiseFloor.prob: 0.5
-FrequencyNoise.f_center: [const, 0.469] # 60 Hz as fraction of Nyquist (60/128)
-FrequencyNoise.f_width: [const, 0.03]   # ~4 Hz wide
-FrequencyNoise.prob: 0.5
+LineNoise60.level_db: [uniform, -30.0, -10.0]   # hum level relative to signal RMS
+LineNoise60.freq_hz: 60.0
+LineNoise60.prob: 0.5
 ClippingDistortion.perc: [uniform, 0.0, 0.05]
 ClippingDistortion.prob: 0.5
 TimeNoise.t_center: [uniform, 0.0, 1.0]
@@ -271,7 +277,13 @@ train/AudioDataset.duration: 5.0     # EEG: was 0.38; 0.38 s = 97 samples crashe
 train/AudioDataset.n_examples: 10000000
 
 val/AudioDataset.duration: 5.0
-val/build_transform.augment_prob: 1.0
+# validation = CLEAN inputs (preprocess + postprocess only): val/loss then measures
+# plain reconstruction quality, comparable across runs regardless of how each was
+# augmented (training-side augment/corrupt do not apply here)
+val/build_transform.augment_prob: 0.0
+val/build_transform.augment: [Identity]
+val/build_transform.corrupt_prob: 0.0
+val/build_transform.corrupt: [Identity]
 val/AudioDataset.n_examples: 250
 
 test/AudioDataset.duration: 10.0
