@@ -490,6 +490,7 @@ def build_transform(
     corrupt = corrupt_cls(*to_tfm(corrupt), name="corrupt", prob=corrupt_prob)
     postprocess = transforms.Compose(*to_tfm(postprocess), name="postprocess")
     transform = transforms.Compose(preprocess, augment, corrupt, postprocess)
+    #JM check here. 
     return transform
 
 
@@ -672,14 +673,17 @@ def train_loop(state, batch, accel, lambdas, codebook_counts=None, gradient_diag
 
     batch = util.prepare_batch(batch, accel.device)
     with torch.no_grad():
-        # INPUT = full transform chain; TARGET = the same chain with the `corrupt`
-        # stage skipped. Transforms under `corrupt` therefore damage only the input,
-        # training the codec to be INVARIANT to them (noise, line hum, clipping);
-        # transforms under `augment` land in input AND target, so the codec must
-        # REPRESENT them (filter diversity); `postprocess` (e.g. EEGNormalize) runs
-        # on both arms AFTER corruption, so inputs always arrive in canonical scale.
-        # Identical transform_args -> shared stages draw identical random parameters
-        # in both calls. With corrupt=[Identity], target == signal (plain DAC).
+        # INPUT = full transform chain
+        # TARGET = the same chain with the `corrupt` stage skipped. 
+
+        # state.train_data.transform | runs all four stages (preprocess, augment, corrupt, postprocess) on the input signal.
+        # state.train_data.transform.filter("preprocess", "augment", "postprocess") | only runs stages named
+
+        # SIGNAL will only be used here: out = state.generator(signal.audio_data, signal.sample_rate)
+        # TARGET will be used in every loss term
+        #   --> e.g.: output["mel/loss"] = state.mel_loss(recons, target)
+        
+
         signal = state.train_data.transform(
             batch["signal"].clone(), **batch["transform_args"]
         )
@@ -687,6 +691,9 @@ def train_loop(state, batch, accel, lambdas, codebook_counts=None, gradient_diag
             target = state.train_data.transform(
                 batch["signal"].clone(), **batch["transform_args"]
             )
+        # import pdb; pdb.set_trace()
+        # batch["transform_args"]
+        # check for: 2.corrupt': {..., 'mask': [F, T, F, F, F, F, T, T]}
 
     with accel.autocast():
         out = state.generator(signal.audio_data, signal.sample_rate)
