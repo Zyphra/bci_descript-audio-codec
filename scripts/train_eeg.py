@@ -1,7 +1,7 @@
 """Train EEG with the original DAC training script's structure and config style.
 
 Run on the reserved physical GPU:
-    CUDA_VISIBLE_DEVICES=6 python scripts/train_eeg.py --args.load conf/base_eeg.yml --WandB.name jm_test_batch600 --save_path runs/jm_test
+    CUDA_VISIBLE_DEVICES=3 python scripts/train_eeg.py --args.load conf/base_eeg.yml --WandB.name jm_test_batch600 --save_path runs/jm_test
 
 """
 
