@@ -24,7 +24,7 @@ import yaml
 REPO_DIR = Path(__file__).resolve().parents[1]
 
 
-run_name_base = "vq_wt"
+run_name_base = "hpf05_hop32"
 run_cntr_start = 0
 #
 jobs_per_GPU = 3
@@ -34,7 +34,9 @@ num_workers = 16 # 16 - turn down if dataloading bottleneck.
 notes_tag = " " # default:  " "
 
 # Parameters to sweep. Each loss tuple is one combination, crossed with every size.
-codebook_sizes = [8192] #[512, 2048, 8192] # [512, 1024, 2048, 4096, 8192]
+
+# codebook_shape = (n_codebooks, codebook_size)
+codebook_shapes = [(1,8192)] # [(2,8192), (4,8192), (2,64), (3,16), (1,64)] #[(1,512), (1,2048), (1,8192)] # [(1,512), (1,1024), (1,2048), (1,4096), (1,8192)]
 #
 loss_combinations = [
   #                                             adv/           vq/ 
@@ -53,12 +55,23 @@ loss_combinations = [
 #   (  0.0, 15.0,      2.0,  1.0,  0.03,  0.0,     0.0,  0.0,     0.25,  1.0 , "15wav+2stft-(1mag, 0.03log)+vq" ),
 #   (  0.0, 15.0,      2.0,  1.0,  0.1,   0.0,     0.0,  0.0,     0.25,  1.0 , "15wav+2stft-(1mag, 0.1log)+vq" ),  
   #
-  (  0.0, 15.0,      2.0,  1.0,  0.03,  0.0,     0.0,  0.0,     0.0625,  1.0 , "15wav+2stft-(1mag, 0.03log)+vq(0.0625comm,1code)" ),
-  (  0.0, 15.0,      2.0,  1.0,  0.03,  0.0,     0.0,  0.0,     0.125,  1.0 , "15wav+2stft-(1mag, 0.03log)+vq(0.125comm,1code)" ),
-  (  0.0, 15.0,      2.0,  1.0,  0.03,  0.0,     0.0,  0.0,     0.25,  1.0 , "15wav+2stft-(1mag, 0.03log)+vq(0.25comm,1code)" ),
-  (  0.0, 15.0,      2.0,  1.0,  0.03,  0.0,     0.0,  0.0,     0.5,  1.0 , "15wav+2stft-(1mag, 0.03log)+vq(0.5comm,1code)" ),
-  (  0.0, 15.0,      2.0,  1.0,  0.03,  0.0,     0.0,  0.0,     1.0,  1.0 , "15wav+2stft-(1mag, 0.03log)+vq(1comm,1code)" ),
+#   (  0.0, 15.0,      2.0,  1.0,  0.03,  0.0,     0.0,  0.0,     0.0625,  1.0 , "15wav+2stft-(1mag, 0.03log)+vq(0.0625comm,1code)" ),
+#   (  0.0, 15.0,      2.0,  1.0,  0.03,  0.0,     0.0,  0.0,     0.125,  1.0 , "15wav+2stft-(1mag, 0.03log)+vq(0.125comm,1code)" ),
+#   (  0.0, 15.0,      2.0,  1.0,  0.03,  0.0,     0.0,  0.0,     0.25,  1.0 , "15wav+2stft-(1mag, 0.03log)+vq(0.25comm,1code)" ),
+#   (  0.0, 15.0,      2.0,  1.0,  0.03,  0.0,     0.0,  0.0,     0.5,  1.0 , "15wav+2stft-(1mag, 0.03log)+vq(0.5comm,1code)" ),
+#   (  0.0, 15.0,      2.0,  1.0,  0.03,  0.0,     0.0,  0.0,     1.0,  1.0 , "15wav+2stft-(1mag, 0.03log)+vq(1comm,1code)" ),
+#   (  0.0, 15.0,      2.0,  1.0,  0.03,  0.0,     0.0,  0.0,     2.0,  1.0 , "15wav+2stft-(1mag, 0.03log)+vq(2comm,1code)" ),
+#   (  0.0, 15.0,      2.0,  1.0,  0.03,  0.0,     0.0,  0.0,     4.0,  1.0 , "15wav+2stft-(1mag, 0.03log)+vq(4comm,1code)" ),
   #
+# (  0.0, 15.0,      2.0,  1.0,  0.03,  0.0,     0.0,  0.0,     2.0,  0.25 , "15wav+2stft-(1mag, 0.03log)+vq(2comm,0.25code)" ),
+# (  0.0, 15.0,      2.0,  1.0,  0.03,  0.0,     0.0,  0.0,     2.0,  0.5 ,  "15wav+2stft-(1mag, 0.03log)+vq(2comm,0.5code)" ),
+# (  0.0, 15.0,      2.0,  1.0,  0.03,  0.0,     0.0,  0.0,     2.0,  2.0 ,  "15wav+2stft-(1mag, 0.03log)+vq(2comm,2code)" ),
+# (  0.0, 15.0,      2.0,  1.0,  0.03,  0.0,     0.0,  0.0,     2.0,  4.0 ,  "15wav+2stft-(1mag, 0.03log)+vq(2comm,4code)" ),
+#
+# (  0.0, 15.0,      2.0,  1.0,  0.03,  0.0,     0.0,  0.0,     1.0,  1.0 ,  "15wav+2stft-(1mag, 0.03log)+vq(1comm,1code)" ),
+# (  0.0, 15.0,      2.0,  1.0,  0.03,  0.0,     0.0,  0.0,     2.0,  1.0 ,  "15wav+2stft-(1mag, 0.03log)+vq(2comm,1code)" ),
+(  0.0, 15.0,      2.0,  1.0,  0.03,  0.0,     0.0,  0.0,     1.0,  4.0 ,  "15wav+2stft-(1mag, 0.03log)+vq(1comm,4code)" ),
+#
 #   (  0.0, 15.0,      1.0,  1.0,  0.0,  0.0,     0.0,  0.0,     0.25,  1.0 , "15wav+1stft-(mag)+vq" ),
 #   (  0.0, 15.0,      2.0,  1.0,  0.0,  0.0,     0.0,  0.0,     0.25,  1.0 , "15wav+2stft-(mag)+vq" ),
 #   (  0.0, 15.0,      4.0,  1.0,  0.0,  0.0,     0.0,  0.0,     0.25,  1.0 , "15wav+4stft-(mag)+vq" ),
@@ -83,12 +96,22 @@ MSSTFT_window_lengths =[
     # ([64, 256], "Default STFT wins"),
 ]
 
+hop_lengths = [
+    # hop,      encoder_rates,   decoder_rates
+    # ("hop64",   [2, 2, 2, 8],    [8, 2, 2, 2]),
+    ("hop32",   [2, 2, 2, 4],    [4, 2, 2, 2]), # default for most other experiments.
+    # ("hop16",   [2, 2, 2, 2],    [2, 2, 2, 2]),
+    # ("hop8",    [2, 2, 2, 1],    [1, 2, 2, 2]),
+]
+
+
 #
-dataset_names = ["rand10k"] ## ["alice", "rand1k", "rand10k"]
+dataset_names = ["rand10k_HPF0.5"] ## ["alice", "rand1k", "rand10k", "rand10k_HPF0.5"]
 dataset_paths = { # Note: must be a dict with keys matching dataset_names.
   "alice": "/data/groups/bci/datasets/alice/Alice/cache/prep2",
   "rand1k": "/data/groups/bci/datasets/processed/v8_sets/1k", 
   "rand10k": "/data/groups/bci/datasets/processed/v8_sets/10k",
+  "rand10k_HPF0.5": "/data/groups/bci/datasets/processed/v8_0.5Hz_sets/10k",
 }
 
 seed_list = [0,1,2] # [0]
@@ -104,49 +127,56 @@ def build_experiments(base_config):
     for dataset_name in dataset_names:
         for loss_tuple in loss_combinations:
             for STFT_wins in MSSTFT_window_lengths:
-                for codebook_size in codebook_sizes:
-                    for seed in seed_list:
-                        #
-                        # Copy before modifying, so experiments never change one another.
-                        config = deepcopy(base_config)
-                        #
-                        # Number of workers
-                        config["num_workers"] = num_workers
-                        #
-                        # Codebook size
-                        config["DAC.codebook_size"] = codebook_size
-                        #
-                        # Losses
-                        config.setdefault("lambdas", {})["mel/loss"] = loss_tuple[0]
-                        config.setdefault("lambdas", {})["waveform/loss"] = loss_tuple[1]
-                        config.setdefault("lambdas", {})["stft/loss"] = loss_tuple[2]
-                        config["MultiScaleSTFTLoss.mag_weight"] = loss_tuple[3]
-                        config["MultiScaleSTFTLoss.log_weight"] = loss_tuple[4]
-                        config["MultiScaleSTFTLoss.phase_weight"] = loss_tuple[5]
-                        config.setdefault("lambdas", {})["adv/feat_loss"] = loss_tuple[6]
-                        config.setdefault("lambdas", {})["adv/gen_loss"] = loss_tuple[7]
-                        config.setdefault("lambdas", {})["vq/commitment_loss"] = loss_tuple[8]
-                        config.setdefault("lambdas", {})["vq/codebook_loss"] = loss_tuple[9]
-                        #
-                        # STFT window lengths
-                        config["MultiScaleSTFTLoss.window_lengths"] = STFT_wins[0]
-                        #
-                        # Replace inherited datasets with this sweep's selected dataset.
-                        config["train/build_dataset.folders"] = {dataset_name: [dataset_paths[dataset_name]+'/train']}
-                        config["val/build_dataset.folders"] = {dataset_name: [dataset_paths[dataset_name]+'/val']}
-                        #
-                        # Name
-                        name = f"{run_name_base}_{next_run_cntr:03d}"
-                        config["WandB.name"] = name
-                        config["save_path"] = f"runs/{name}"
-                        next_run_cntr += 1
-                        #
-                        config["seed"] = seed
-                        #
-                        # Notes : configure this to show short hand version of the config
-                        config["WandB.notes"] = f"TBD:{notes_tag}codes={config['DAC.n_codebooks']}x{codebook_size}. {loss_tuple[10]}. {STFT_wins[1]}. {dataset_name} data. seed={seed}"
-                        #
-                        experiments.append((name, config))
+                for n_codebooks, codebook_size in codebook_shapes:
+                    for hop_str, encoder_rates, decoder_rates in hop_lengths:
+                        for seed in seed_list:
+                            #
+                            # Copy before modifying, so experiments never change one another.
+                            config = deepcopy(base_config)
+                            #
+                            # Number of workers
+                            config["num_workers"] = num_workers
+                            #
+                            # Codebook size
+                            config["DAC.codebook_size"] = codebook_size
+                            config["DAC.n_codebooks"] = n_codebooks
+                            #
+                            # Hop length
+                            config["DAC.encoder_rates"] = encoder_rates
+                            config["DAC.decoder_rates"] = decoder_rates
+                            #
+                            # Losses
+                            config.setdefault("lambdas", {})["mel/loss"] = loss_tuple[0]
+                            config.setdefault("lambdas", {})["waveform/loss"] = loss_tuple[1]
+                            config.setdefault("lambdas", {})["stft/loss"] = loss_tuple[2]
+                            config["MultiScaleSTFTLoss.mag_weight"] = loss_tuple[3]
+                            config["MultiScaleSTFTLoss.log_weight"] = loss_tuple[4]
+                            config["MultiScaleSTFTLoss.phase_weight"] = loss_tuple[5]
+                            config.setdefault("lambdas", {})["adv/feat_loss"] = loss_tuple[6]
+                            config.setdefault("lambdas", {})["adv/gen_loss"] = loss_tuple[7]
+                            config.setdefault("lambdas", {})["vq/commitment_loss"] = loss_tuple[8]
+                            config.setdefault("lambdas", {})["vq/codebook_loss"] = loss_tuple[9]
+                            #
+                            # STFT window lengths
+                            config["MultiScaleSTFTLoss.window_lengths"] = STFT_wins[0]
+                            #
+                            # Replace inherited datasets with this sweep's selected dataset.
+                            config["train/build_dataset.folders"] = {dataset_name: [dataset_paths[dataset_name]+'/train']}
+                            config["val/build_dataset.folders"] = {dataset_name: [dataset_paths[dataset_name]+'/val']}
+                            #
+                            # Name
+                            name = f"{run_name_base}_s{seed}"
+                            #name = f"{run_name_base}_{next_run_cntr:03d}"
+                            config["WandB.name"] = name
+                            config["save_path"] = f"runs/{name}"
+                            next_run_cntr += 1
+                            #
+                            config["seed"] = seed
+                            #
+                            # Notes : configure this to show short hand version of the config
+                            config["WandB.notes"] = f"TBD:{notes_tag}codes={n_codebooks}x{codebook_size}. {hop_str}. {loss_tuple[10]}. {STFT_wins[1]}. {dataset_name} data. seed={seed}"
+                            #
+                            experiments.append((name, config))
     return experiments
 
 
