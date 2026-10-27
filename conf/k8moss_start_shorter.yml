@@ -1,0 +1,13 @@
+# Same full-Alice low-commitment experiment; only shorten the input patches.
+$include:
+  - conf/k8moss_alice_low_commit.yml
+
+# 256 Hz * 1/32 s = 8 samples/patch. Three 2x merges give a 64-sample hop:
+# 1280 samples -> 160 patches -> 80 -> 40 -> 20 quantized positions.
+# Keep the embedding width independent of the shorter patch length.
+K8MOSS.coarse_time: 0.03125
+K8MOSS.embed_dim: 128
+
+save_path: runs/k8moss_start_shorter
+WandB.name: k8moss_start_shorter
+WandB.notes: 'Full Alice cleaned_noref: 39 train subjects, 6 held-out val subjects; random channels and 5s crops; fresh seed=0; embed_dim=128; 8-sample patches; 20 tokens; RVQ=1x8192, dim=8; 15wav+2STFT+0.1commit+4codebook'

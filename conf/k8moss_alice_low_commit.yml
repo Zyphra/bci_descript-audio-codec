@@ -1,0 +1,200 @@
+# Full Alice cleaned_noref training, with all shared settings included here.
+# Starts fresh: 32-sample input patches -> 256-sample hop -> 5 tokens per 5s.
+# k8moss_start_shorter.yml includes this file and changes only patch duration
+# plus run metadata. Neither configuration needs the local historical configs.
+generator_type: k8moss
+DAC.sample_rate: 256
+DAC.encoder_dim: 64
+DAC.encoder_rates:
+- 2
+- 2
+- 2
+- 4
+DAC.decoder_dim: 1536
+DAC.decoder_rates:
+- 4
+- 2
+- 2
+- 2
+DAC.n_codebooks: 1
+DAC.codebook_size: 8192
+DAC.codebook_dim: 8
+DAC.quantizer_dropout: 0.0
+Discriminator.sample_rate: 256
+Discriminator.rates: []
+Discriminator.periods: []
+Discriminator.fft_sizes:
+- 256
+- 128
+- 64
+Discriminator.bands:
+- - 0.0
+  - 0.1
+- - 0.1
+  - 0.25
+- - 0.25
+  - 0.5
+- - 0.5
+  - 0.75
+- - 0.75
+  - 1.0
+AdamW.betas:
+- 0.8
+- 0.99
+AdamW.lr: 0.0001
+ExponentialLR.gamma: 0.999996
+amp: false
+val_batch_size: 128
+device: cuda
+num_iters: 60000
+save_iters:
+- 2000
+- 4000
+- 6000
+- 8000
+- 10000
+- 12000
+- 14000
+- 16000
+- 18000
+- 20000
+- 22000
+- 24000
+- 26000
+- 28000
+- 30000
+- 32000
+- 34000
+- 36000
+- 38000
+- 40000
+- 42000
+- 44000
+- 46000
+- 48000
+- 50000
+- 52000
+- 54000
+- 56000
+- 58000
+- 60000
+valid_freq: 2000
+sample_freq: 2000
+num_workers: 16
+val_idx:
+- 0
+- 1
+- 2
+- 3
+- 4
+- 5
+- 6
+- 7
+seed: 0
+lambdas:
+  mel/loss: 0.0
+  stft/loss: 2.0
+  waveform/loss: 15.0
+  adv/feat_loss: 0.0
+  adv/gen_loss: 0.0
+  vq/commitment_loss: 0.1
+  vq/codebook_loss: 4.0
+build_transform.preprocess:
+- EEGNormalize
+EEGNormalize.target_std: 0.3
+EEGNormalize.clip: 1.0
+EEGNormalize.prob: 1.0
+build_transform.augment_prob: 0.0
+build_transform.augment:
+- Identity
+build_transform.postprocess:
+- Identity
+MultiScaleSTFTLoss.window_lengths:
+- 16
+- 32
+- 64
+- 128
+- 256
+MultiScaleSTFTLoss.mag_weight: 1.0
+MultiScaleSTFTLoss.log_weight: 0.03
+MultiScaleSTFTLoss.phase_weight: 0.0
+MelSpectrogramLoss.n_mels:
+- 5
+- 10
+- 20
+- 40
+- 64
+MelSpectrogramLoss.window_lengths:
+- 16
+- 32
+- 64
+- 128
+- 256
+MelSpectrogramLoss.mel_fmin:
+- 0
+- 0
+- 0
+- 0
+- 0
+MelSpectrogramLoss.mel_fmax:
+- null
+- null
+- null
+- null
+- null
+MelSpectrogramLoss.pow: 1.0
+MelSpectrogramLoss.clamp_eps: 1.0e-05
+MelSpectrogramLoss.mag_weight: 0.0
+batch_size: 128
+train/AudioDataset.duration: 5.0
+train/AudioDataset.n_examples: 10000000
+val/AudioDataset.duration: 5.0
+val/build_transform.augment_prob: 1.0
+val/AudioDataset.n_examples: 2500
+test/AudioDataset.duration: 10.0
+test/build_transform.augment_prob: 1.0
+test/AudioDataset.n_examples: 1000
+AudioLoader.shuffle: true
+AudioLoader.EEG: true
+AudioDataset.without_replacement: true
+train/build_dataset.folders:
+  alice_cleaned_noref:
+  - /data/groups/bci/datasets/alice/Alice/cache/prep2/train/*_cleaned_noref_raw.fif
+val/build_dataset.folders:
+  alice_cleaned_noref:
+  - /data/groups/bci/datasets/alice/Alice/cache/prep2/val/*_cleaned_noref_raw.fif
+save_path: runs/k8moss_alice_low_commit
+resume: false
+WandB.enabled: true
+WandB.project: dac-eeg-cw
+WandB.entity: ''
+WandB.name: k8moss_alice_low_commit
+WandB.group: alice
+WandB.tags:
+- eeg
+- dac
+WandB.mode: online
+WandB.log_freq: 1
+WandB.log_reconstruction: true
+WandB.stft_window_length: 256
+WandB.watch_model: false
+WandB.notes: 'Full Alice cleaned_noref: 39 train subjects, 6 held-out val subjects; random channels and
+  5s crops; fresh seed=0; embed_dim=128; 5 tokens; RVQ=1x8192, dim=8; 15wav+2STFT+0.1commit+4codebook'
+GradientDiagnostics.enabled: true
+GradientDiagnostics.every_steps: 1000
+GradientDiagnostics.early_steps:
+- 1
+- 2
+- 5
+- 10
+args.debug: false
+K8MOSS.coarse_time: 0.125
+K8MOSS.projection_stages:
+- 0.5
+- 0.5
+- 0.75
+- 0.75
+K8MOSS.num_heads: 4
+K8MOSS.theta: 10000.0
+K8MOSS.embed_dim: 128
+K8MOSS.zero_init_biases: false

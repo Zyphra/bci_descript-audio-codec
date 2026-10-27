@@ -181,3 +181,17 @@ scripts/eval/logs/*
 scripts/eval/results/
 scripts/eval/__pycache__/
 scripts/eval_codex/
+
+# Keep local shell launchers out of new commits; existing tracked scripts remain tracked.
+*.sh
+
+# Local k8MOSS experiment history and diagnostics; keep these files on disk.
+/conf/vq_long_006.yml
+/conf/k8moss_vq_long_006.yml
+/conf/k8moss_init.yml
+/conf/k8moss_increase_embedsize.yml
+/conf/k8moss_alice_overfit.yml
+/conf/k8moss_alice_ablations.yml
+/scripts/overfit_k8moss.py
+/tests/test_k8moss.py
+/tests/test_k8moss_overfit.py
