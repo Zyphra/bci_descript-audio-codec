@@ -197,4 +197,3 @@ K8MOSS.projection_stages:
 K8MOSS.num_heads: 4
 K8MOSS.theta: 10000.0
 K8MOSS.embed_dim: 128
-K8MOSS.zero_init_biases: false

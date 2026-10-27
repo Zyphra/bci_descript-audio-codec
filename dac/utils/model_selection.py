@@ -30,7 +30,6 @@ def K8MOSS(
     coarse_time: float = 1 / 8,
     projection_stages: list = [0.5, 0.5, 0.75, 0.75],
     embed_dim: int = None,
-    zero_init_biases: bool = False,
     num_heads: int = 4,
     theta: float = 10000.0,
 ):
@@ -41,7 +40,6 @@ def K8MOSS(
         coarse_time=coarse_time,
         projection_stages=projection_stages,
         embed_dim=embed_dim,
-        zero_init_biases=zero_init_biases,
         num_heads=num_heads,
         theta=theta,
     )

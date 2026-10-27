@@ -1,5 +1,3 @@
-"""Single-channel transformer codec with temporal RoPE and DAC's unchanged RVQ."""
-
 from typing import List, Optional, Union
 
 import torch
@@ -11,25 +9,35 @@ from dac.nn.quantize import ResidualVectorQuantize
 
 
 class k8MOSS(BaseModel):
-    """Encode independent segments; no channel identities or spatial coordinates.
+    """
+    Patch-merging transformer quantizer inspired by MOSS Tokenizer
+    https://arxiv.org/pdf/2602.10934
 
-    The token stride is ``patch_length * 2 ** (len(projection_stages) - 1)``.
-    At 256 Hz with coarse_time=1/8, 32-sample patches and three temporal
-    merges produce five quantized tokens per 1280-sample segment. The embedding
-    width defaults to four times the patch length; embed_dim can override it
-    without changing the temporal geometry. zero_init_biases enables the
-    initialization experiment for linear layers and RVQ projections.
-    Inputs must contain a positive multiple of the token stride.
+    Key ingredients:
+    (1) Coarse-time: defines the initial patch size in seconds
+    (2) Projection stages: defines the down-projection schedule in a series of proportions in (0, 1]
+        (a) to get number of token IDs per second, do 
+        int(1 / coarse_time / 2^{len(projection_stages)})
+    (3) embed_dim: defines the initial projection size to transformer model dimension
+        (a) important because embed_dim will define what projection stage values give valid integers downstream
+        (b) defaults to 4*patch_length to keep same proportionality as original MOSS, but still much smaller for EEG
+
+    General idea: 
+    (1) Right now, no channel dimension (singleton dimension) so no channel coordinates
+    (2) Transformer process each channel-sample as an indepedent stream of tokens
+    (3) Loop:
+        (a) MERGE: halve tokens, double token dimensionality
+            (i) No loss of information, just merges temporally adjacent positions
+        (b) TRANSFORMER: mix time information into merged tokens
+        (c) PROJECT: 
     """
 
     def __init__(
         self,
         sampling_rate: int = 256,
-        coarse_time: float = 1 / 8,
+        coarse_time: float = 1 / 8, # seconds
         projection_stages: Optional[List[float]] = None,
-        *,
         embed_dim: Optional[int] = None,
-        zero_init_biases: bool = False,
         num_heads: int = 4,
         theta: float = 10000.0,
         n_codebooks: int = 4,
@@ -48,7 +56,6 @@ class k8MOSS(BaseModel):
         self.embed_dim = 4 * self.patch_length if embed_dim is None else embed_dim
         if not isinstance(self.embed_dim, int) or self.embed_dim <= 0:
             raise ValueError("embed_dim must be a positive integer")
-        self.zero_init_biases = zero_init_biases
         self.projection_stages = (
             [0.5, 0.5, 0.75, 0.75]
             if projection_stages is None else list(projection_stages)
@@ -92,15 +99,6 @@ class k8MOSS(BaseModel):
             quantizer_dropout=quantizer_dropout,
         )
         self.decoder = Decoder(self.patch_length, self.stage_widths, num_heads, theta)
-        if self.zero_init_biases:
-            # Match the diagnostic ablation: preserve all weight draws and the
-            # codebook, zero only Linear and RVQ input/output projection biases.
-            for module in self.modules():
-                if isinstance(module, nn.Linear) and module.bias is not None:
-                    nn.init.zeros_(module.bias)
-            for quantizer in self.quantizer.quantizers:
-                nn.init.zeros_(quantizer.in_proj.bias)
-                nn.init.zeros_(quantizer.out_proj.bias)
 
     def check_input_length(self, data):
         length = data.shape[-1]
@@ -162,14 +160,16 @@ class Encoder(nn.Module):
         ])
 
     def forward(self, data):
+        # W: current token count; D_in/D_out: encoder stage input/output widths.
         B, _, T = data.shape
-        x = data.reshape(B, 1, T // self.patch_length, self.patch_length)
-        x = self.patch_projection(x)
+        x = data.reshape(B, 1, T // self.patch_length, self.patch_length)  # [B, 1, W, patch_length]
+        x = self.patch_projection(x)  # [B, 1, W, embed_dim]
         for stage, (attention, projection) in enumerate(zip(self.attention, self.projections)):
             if stage > 0:
-                x = self.merge(x)
-            x = projection(attention(x, stage))
-        return x.squeeze(1)
+                x = self.merge(x)  # [B, 1, W, D] -> [B, 1, W // 2, 2 * D]
+            x = attention(x, stage)  # [B, 1, W, D_in]
+            x = projection(x)  # [B, 1, W, D_out]
+        return x.squeeze(1)  # [B, W, latent_dim]
 
     @staticmethod
     def merge(x):
@@ -190,13 +190,15 @@ class Decoder(nn.Module):
         self.patch_projection = nn.Linear(stage_widths[0][0], patch_length)
 
     def forward(self, x):
+        # W: current token count; D_in/D_out: encoder stage input/output widths.
         B = x.shape[0]
         for stage in reversed(range(len(self.projections))):
-            x = self.projections[stage](x)
-            x = self.attention[stage](x, stage)
+            x = self.projections[stage](x)  # [B, 1, W, D_out] -> [B, 1, W, D_in]
+            x = self.attention[stage](x, stage)  # [B, 1, W, D_in]
             if stage > 0:
-                x = self.unmerge(x)
-        return self.patch_projection(x).reshape(B, 1, -1)
+                x = self.unmerge(x)  # [B, 1, W, D] -> [B, 1, 2 * W, D // 2]
+        x = self.patch_projection(x)  # [B, 1, W, patch_length]
+        return x.reshape(B, 1, -1)  # [B, 1, T]
 
     @staticmethod
     def unmerge(x):
@@ -234,9 +236,7 @@ class Attention(nn.Module):
             .permute(2, 0, 3, 1, 4).unbind(0)
         )
         q, k = self.apply_rope(q, k, positions)
-        # The fused CUDA backward fails with an illegal instruction on this
-        # repo's PyTorch 2.0.1/H100 setup. Math SDPA preserves the same attention
-        # operation and supports the trainer's repeated gradient diagnostics.
+
         with torch.backends.cuda.sdp_kernel(
             enable_flash=False, enable_math=True, enable_mem_efficient=False
         ):
