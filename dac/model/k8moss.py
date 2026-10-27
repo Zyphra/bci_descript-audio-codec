@@ -16,11 +16,12 @@ class k8MOSS(BaseModel):
     Key ingredients:
     (1) Coarse-time: defines the initial patch size in seconds
     (2) Projection stages: defines the down-projection schedule in a series of proportions in (0, 1]
-        (a) to get number of token IDs per second, do 
-        int(1 / coarse_time / 2^{len(projection_stages)})
+        (a) to get number of token IDs per second, do
+            sampling_rate / (int(sampling_rate * coarse_time) * 2 ** (len(projection_stages) - 1))
+        (b) First projection stage skips merging, hence len(projection_stages) - 1
     (3) embed_dim: defines the initial projection size to transformer model dimension
         (a) important because embed_dim will define what projection stage values give valid integers downstream
-        (b) defaults to 4*patch_length to keep same proportionality as original MOSS, but still much smaller for EEG
+        (b) defaults to 4*patch_length to keep roughly same proportionality as original MOSS, but still much smaller for EEG
 
     General idea: 
     (1) Right now, no channel dimension (singleton dimension) so no channel coordinates
@@ -29,7 +30,8 @@ class k8MOSS(BaseModel):
         (a) MERGE: halve tokens, double token dimensionality
             (i) No loss of information, just merges temporally adjacent positions
         (b) TRANSFORMER: mix time information into merged tokens
-        (c) PROJECT: 
+            (i) classic noncausal MHA with RoPE temporal embeddings
+        (c) PROJECT: down-project the halved-tokens
     """
 
     def __init__(
