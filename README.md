@@ -170,70 +170,20 @@ exact supplied file) and `config_resolved.yml` (defaults plus command-line
 overrides actually used). The resolved configuration is also stored in W&B and
 inside each checkpoint. Earlier outputs remain in `runs/old/`.
 
-## Optional k8MOSS transformer
+## k8MOSS transformer
 
-Added an optional transformer training path in `scripts/train_jrh.py`, which
-supports both architectures using the CW training path. The teammates'
-`scripts/train_cw.py` and `scripts/train_jm.py` retain their original implementations.
-`generator_type: dac` is the default and uses the existing convolutional DAC.
-`generator_type: k8moss` selects `dac/model/k8moss.py`, a transformer operating
-on independent single-channel segments with noncausal attention and temporal
-RoPE. Both use the same
-`ResidualVectorQuantize` implementation. The shared sample rate and quantizer
-settings remain `DAC.sample_rate`, `DAC.n_codebooks`, `DAC.codebook_size`,
-`DAC.codebook_dim`, and `DAC.quantizer_dropout`; convolution-specific `DAC.*`
-settings only affect DAC. Transformer-specific settings use `K8MOSS.*`.
+JRH: add transformer training path in `scripts/train_jrh.py`
 
-The two Alice configurations run from the repository root in the EEG environment,
-with the EEG-enabled `bci_audiotools` checkout available on `PYTHONPATH`.
-Select an available GPU through `CUDA_VISIBLE_DEVICES`:
+Setting `generator_type: k8moss` selects `dac/model/k8moss.py`, Still uses the same
+`ResidualVectorQuantize` implementation. Transformer-specific settings use `K8MOSS.*`.
 
 ```bash
-python scripts/train_jrh.py --args.load conf/k8moss_alice_low_commit.yml
 python scripts/train_jrh.py --args.load conf/k8moss_start_shorter.yml
 ```
 
-Both configurations start fresh on the full Alice `cleaned_noref` split: 39
-training subjects and six disjoint validation subjects. The loader samples random
-usable EEG channels and five-second crops at 256 Hz, normalizes to standard
-deviation 0.3, and clips to [-1, 1]. The dataset globs use BCI cluster paths;
-adjust those paths for another environment. Each configuration uses its own
-output directory and online W&B run.
-
-Shared settings are batch size 128, seed 0, 60,000 updates, and validation over
-2,500 examples every 2,000 updates. RVQ uses one 8,192-entry codebook with
-8-dimensional vectors and no quantizer dropout. The objective is
-`15*waveform + 2*STFT + 0.1*commitment + 4*codebook`, with STFT windows
-`[16, 32, 64, 128, 256]`, magnitude weight 1 and log weight 0.03. The JRH trainer
-uses this reconstruction and VQ objective for both Alice configurations.
-
-| Configuration | Input patch duration | Samples per patch | Output stride | IDs per five seconds |
-| --- | --- | --- | --- | --- |
-| `conf/k8moss_alice_low_commit.yml` | 1/8 s | 32 | 256 samples / 1 s | 5 |
-| `conf/k8moss_start_shorter.yml` | 1/32 s | 8 | 64 samples / 1/4 s | 20 |
-
-The low-commitment config contains all shared settings. The shorter-patch config
-includes it and changes only the input patch duration and run metadata. Both
-explicitly keep embedding width 128, four attention heads, three temporal merges,
-and encoder output width 144. Input patch duration and final token spacing are
-different: the three merges multiply the patch length by eight. RVQ projects
-each encoder vector into the 8-dimensional codebook space before lookup.
-
-Input and reconstruction are `[B, 1, 1280]` (or `[B, 1280]` when called directly).
-Codes are `[B, 1, 5]` or `[B, 1, 20]`, respectively. Input lengths must be positive
-multiples of the output stride. Direct construction via `dac.model.k8MOSS()`
-retains the supplied four-codebook default; both training configurations override
-that to one codebook. `K8MOSS.embed_dim` sets embedding width independently of
-patch duration.
-
-The transformer implements the trainer's `encode`/`decode`, loss-output, codebook
-mask, diagnostics, and checkpoint interfaces. Checkpoints use `dac/` or
-`k8moss/` beneath each checkpoint tag. Resuming a different architecture's
-directory raises an error. Model widths and parameter counts differ; the
-transformer keeps the supplied linear reconstruction head, while DAC uses tanh.
-Attention uses PyTorch's math SDPA backend because the fused CUDA backward fails
-on the pinned PyTorch 2.0.1/H100 environment; the attention operation is unchanged.
-The existing audio compression CLI continues to use DAC.
+Input lengths must be positive multiples of the output stride. Be careful with the projection stages. 
+I have thrown an error here to prevent non-integer sized transformer layers but bugs are possible. Expected 
+shape analysis should be reasoned through before training. 
 
 ---
 

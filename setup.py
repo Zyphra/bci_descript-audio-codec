@@ -36,6 +36,7 @@ setup(
         "tqdm",
     ],
     extras_require={
+        "eval": ["linear-attention-transformer==0.19.1"],
         "tracking": ["wandb>=0.17.9", "plotly>=5.24.1,<6"],
         "dev": [
             "pytest",

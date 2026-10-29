@@ -1,12 +1,22 @@
 """Train EEG with JRH's optional k8MOSS transformer or convolutional DAC.
 
 Uses the CW training path with architecture selection and shared RVQ settings.
+Classifiers run in separate Slurm jobs at step 0 and every classifier_every updates
+(default 5000; 0 disables). classifier_sbatch sets resources; classifier_python
+selects an environment with this repo and its [eval] extra installed. Snapshots and
+metrics live in save_path/evals; W&B uses a linked classifier run.
+classifier_datasets maps metric names to EEG cache directories containing cache.json.
+classifier_models selects transformer/bag_of_tokens (an empty list disables evaluation).
+classifier_config sets training settings and transformer/bag_of_tokens constructor options;
+resolved settings are saved in launch configs, evaluation jobs, and W&B.
+classifier_token_cache holds the fixed TFM/LaBraM caches, organized by dataset name.
 Run from the repository root in the EEG environment, selecting an available GPU::
     CUDA_VISIBLE_DEVICES=3 python scripts/train_jrh.py --args.load conf/k8moss_alice_low_commit.yml
     CUDA_VISIBLE_DEVICES=3 python scripts/train_jrh.py --args.load conf/k8moss_start_shorter.yml
 """
 
 import os
+import inspect
 import math
 import json
 import shutil
@@ -39,6 +49,7 @@ from dac.utils.provenance import create_launch_record, link_wandb_launch
 from dac.utils.wandb_resume import prepare_wandb_run
 from dac.utils.codebook_charts import wandb_summary_charts
 from dac.utils.model_selection import SHARED_SETTINGS, build_generator, load_generator
+from evals.classify import submit as submit_classifiers
 from dac.utils.gradient_diagnostics import (
     GENERATOR_CLIP_NORM,
     GradientDiagnostics as GradientMonitor,
@@ -423,6 +434,7 @@ def load(
         scheduler_g.load_state_dict(g_extra["scheduler.pth"])
     if "tracker.pth" in g_extra:
         tracker.load_state_dict(g_extra["tracker.pth"])
+        tracker.step += 1  # Saved step is the last completed update's zero-based index.
 
     if "optimizer.pth" in d_extra:
         optimizer_d.load_state_dict(d_extra["optimizer.pth"])
@@ -1024,6 +1036,22 @@ def train(
     save_iters: list = [10000, 50000, 100000, 200000],
     sample_freq: int = 10000,
     valid_freq: int = 1000,
+    classifier_every: int = 5000,  # 0 disables classifiers
+    classifier_python: str = sys.executable,
+    classifier_models: list = ["transformer", "bag_of_tokens"],
+    classifier_config: dict = {
+        "seed": 33, "epochs": 30, "batch_size": 32, "learning_rate": 1e-3,
+        "transformer": {"model_dim": 64, "heads": 2, "depth": 4, "temporal_pos": "sinusoidal",
+                        "channel_pos": "learned", "aggregation_mode": "mean_pool_final", "normalize": True},
+        "bag_of_tokens": {"C": 1.0},
+    },
+    classifier_token_cache: str = "/data/groups/bci/token_cache",
+    classifier_datasets: dict = {
+        "depression": "/data/groups/bci/jonhuml/workspace/token_evals/miniFormer/dataset cache/depression/data",
+        "ssvep": "/data/groups/bci/jonhuml/workspace/token_evals/miniFormer/dataset cache/ssvep/data",
+    },
+    classifier_sbatch: list = ["--partition=gpu", "--gpus=1", "--cpus-per-task=4",
+                              "--mem=16G", "--time=02:00:00"],
     batch_size: int = 12,
     val_batch_size: int = 10,
     num_workers: int = 8,
@@ -1056,6 +1084,15 @@ def train(
             f"Keys are case-sensitive. Allowed: {sorted(allowed_loss_keys)}"
         )
 
+    if classifier_every < 0:
+        raise ValueError("classifier_every must be nonnegative")
+    defaults = inspect.signature(train).parameters["classifier_config"].default
+    unknown = classifier_config.keys() - defaults.keys()
+    if unknown:
+        raise ValueError(f"Unknown classifier settings: {sorted(unknown)}")
+    classifier_config = {k: {**v, **classifier_config.get(k, {})} if isinstance(v, dict)
+                         else classifier_config.get(k, v) for k, v in defaults.items()}
+    args["classifier_config"] = classifier_config
     util.seed(seed)
     Path(save_path).mkdir(exist_ok=True, parents=True)
     writer = (
@@ -1126,6 +1163,7 @@ def train(
         if is_primary:
             # Record values actually consumed by argbind after initialization too.
             used_args = dict(argbind.get_used_args())
+            used_args["classifier_config"] = classifier_config
             model = accel.unwrap(state.generator)
             used_args.update({f"DAC.{key}": getattr(model, key) for key in SHARED_SETTINGS
                               if key != "quantizer_dropout"})
@@ -1145,6 +1183,12 @@ def train(
 
         # Reset on each log (and on resume): these are recent, not lifetime counts.
         model = accel.unwrap(state.generator)
+        classifier_output = Path(save_path) / "evals" / state.launch_id if is_primary else None
+        if is_primary and tracker.step == 0:
+            # Capture untrained weights before the first forward/backward; evaluation is asynchronous.
+            submit_classifiers(model, tracker.step, classifier_output, args, wandb_run,
+                               classifier_every, classifier_sbatch, classifier_datasets, classifier_python,
+                               models=classifier_models, token_cache=classifier_token_cache, config=classifier_config)
         train_codebook_counts = torch.zeros(
             model.n_codebooks, model.codebook_size, dtype=torch.long, device=accel.device
         )
@@ -1155,6 +1199,11 @@ def train(
                     codebook_counts=train_codebook_counts,
                     gradient_diagnostics=gradient_diagnostics,
                 )
+                if is_primary:
+                    submit_classifiers(model, tracker.step + 1, classifier_output,
+                                       args, wandb_run, classifier_every, classifier_sbatch,
+                                       classifier_datasets, classifier_python,
+                                       models=classifier_models, token_cache=classifier_token_cache, config=classifier_config)
 
                 last_iter = (
                     tracker.step == num_iters - 1 if num_iters is not None else False
