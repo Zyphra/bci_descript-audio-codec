@@ -1,4 +1,5 @@
-"""Submit isolated Slurm evaluations; rerun a snapshot with python -m evals.classify DIRECTORY."""
+"""Launch background evaluations; rerun a snapshot with python -m evals.classify DIRECTORY."""
+import fcntl
 import hashlib
 import json
 import os
@@ -7,13 +8,14 @@ import shlex
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
+import time
 import warnings
 
 from .data import load_tokens, sha256
 
 
 def save_json(path, value):
-    """Publish metrics, baseline scores, and plot history only after a complete write."""
+    """Publish JSON only after a complete write."""
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
@@ -21,29 +23,30 @@ def save_json(path, value):
 
 
 def submit(model, step, output, args, wandb_run, every, sbatch_args, datasets, python=sys.executable,
-           models=("transformer", "bag_of_tokens"), token_cache="/data/groups/bci/token_cache", *, config):
-    """Freeze weights before submission; singleton jobs serialize this run's evaluations."""
+           models=("transformer", "bag_of_tokens"), token_cache="/data/groups/bci/token_cache", *, config, gpu="same"):
+    """Freeze weights; serialize evaluations locally, or use Slurm when gpu='slurm'."""
     if len(set(models)) != len(models) or set(models) - {"transformer", "bag_of_tokens"}:
         raise ValueError("classifier_models must contain transformer and/or bag_of_tokens, without duplicates")
     if not models or not every or step % every:
         return
+    if gpu == "same":
+        index = next(model.parameters()).device.index or 0
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+        gpu = visible.split(",")[index] if visible else str(index)
     output = Path(output).resolve()
     destination = output / f"step_{step:08d}"
     output.mkdir(parents=True, exist_ok=True)
     if not destination.exists():
-        job = {**config, "step": step, "architecture": type(model).__name__,
+        job = {**config, "step": step, "architecture": type(model).__name__, "gpu": gpu,
                "models": list(models), "token_cache": str(Path(token_cache).resolve()),
                "datasets": {name: {"directory": str(Path(path).resolve()),
                                     "sha256": sha256(Path(path) / "cache.json")} for name, path in datasets.items()},
                "target_std": args.get("EEGNormalize.target_std", 0.3),
                "clip": args.get("EEGNormalize.clip", 1.0), "wandb": None}
         if wandb_run is not None:
-            selection = hashlib.sha256(json.dumps([sorted(models), config], sort_keys=True).encode()).hexdigest()[:8]
             job["wandb"] = {"project": wandb_run.project, "entity": wandb_run.entity,
-                            "id": f"{wandb_run.id}-classifiers-{selection}", "name": wandb_run.name + "-classifiers",
-                            "group": wandb_run.group or wandb_run.id,
+                            "id": wandb_run.id,
                             "mode": args.get("WandB.mode", "online")}
-            job["parent_run"] = wandb_run.url
         with TemporaryDirectory(prefix=".snapshot-", dir=output) as scratch:
             staging = Path(scratch) / "data"
             staging.mkdir()
@@ -58,15 +61,25 @@ def submit(model, step, output, args, wandb_run, every, sbatch_args, datasets, p
                          "LOCAL_WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT")}
     env.update(OMP_NUM_THREADS="1", MKL_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1")
     run_id = hashlib.sha256(str(output.parent.parent).encode()).hexdigest()[:12]
+    worker = [python, "-m", "evals.classify", str(destination)]
     command = ["sbatch", *sbatch_args, "--parsable", "--dependency=singleton", "--export=ALL",
                f"--job-name=classifier-{run_id}",
                f"--chdir={Path(__file__).resolve().parents[1]}",
                f"--output={destination}/slurm-%j.log", "--wrap",
-               shlex.join([python, "-m", "evals.classify", str(destination)])]
+               shlex.join(worker)]
     try:
-        result = subprocess.run(command, env=env, check=True, capture_output=True, text=True, timeout=15)
-        (destination / "job_id.txt").write_text(result.stdout.strip() + "\n")
-        print(f"Classifier step {step}: submitted Slurm job {result.stdout.strip()}", flush=True)
+        if gpu == "slurm":
+            result = subprocess.run(command, env=env, check=True, capture_output=True, text=True, timeout=15)
+            job_id = result.stdout.strip()
+        else:
+            env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+            with (destination / "worker.log").open("a") as log:
+                process = subprocess.Popen(["flock", "-F", str(output.parent / "classifier.lock"), *worker],
+                    env=env, cwd=Path(__file__).resolve().parents[1], stdin=subprocess.DEVNULL,
+                    stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+            job_id = f"local:{process.pid}"
+        (destination / "job_id.txt").write_text(job_id + "\n")
+        print(f"Classifier step {step}: launched {job_id} (GPU {gpu})", flush=True)
     except (OSError, subprocess.SubprocessError) as error:
         warnings.warn(f"Classifier submission failed; snapshot retained at {destination}: "
                       f"{getattr(error, 'stderr', None) or error}", RuntimeWarning)
@@ -171,35 +184,114 @@ def evaluate(directory, device="cuda"):
         del model, blob
         save_json(result_path, results)
     if job["wandb"] is not None:
+        os.environ.pop("WANDB_SERVICE", None)
         import wandb
 
-        history_path = directory.parents[1] / f"history-{job['wandb']['id']}.json"
-        history = json.loads(history_path.read_text()) if history_path.exists() else {}
-        history[str(job["step"])] = results["datasets"]
-        save_json(history_path, history)
-        with wandb.init(**job["wandb"], resume="allow", dir=str(directory), job_type="classifier",
-                        config={"parent_run": job["parent_run"], "datasets": job["datasets"],
-                                "models": job["models"], "classifier_config": {
-                                    k: job.get(k, {}) for k in ("seed", "epochs", "batch_size", "learning_rate",
-                                                               "transformer", "bag_of_tokens")}}) as run:
-            run.define_metric("tokenizer_step", hidden=True)
-            panels = {"tokenizer_step": job["step"]}
-            for dataset in job["datasets"]:
-                for model in job["models"]:
-                    steps = sorted(int(s) for s, row in history.items()
-                                   if "test" in row.get(dataset, {}).get(model, {}))
-                    series = {"tokenizer": [history[str(s)][dataset][model] for s in steps]}
-                    series.update({source: [results["baselines"][dataset][source.lower()][model]] * len(steps)
-                                   for source in ("TFM", "LaBraM")})
-                    for metric in ("cross_entropy", "balanced_accuracy"):
-                        ys = [[row[split][metric] for row in scores]
-                              for scores in series.values() for split in ("train", "val", "test")]
-                        panels[f"classifier/{dataset}/{model}/{metric}"] = wandb.plot.line_series(
-                            steps, ys, keys=[f"{source}/{split}" for source in series
-                                            for split in ("train", "val", "test")],
-                            title=f"{dataset}: {model} {metric.replace('_', ' ')}", xname="Tokenizer step")
-            run.log(panels)
+        output = directory.parents[1]
+        logged = output / "logged_step.txt"
+        # Training owns the run until it exits; late results can then be published here.
+        while not logged.exists() or int(logged.read_text()) < job["step"]:
+            with (output / "wandb.lock").open("a") as lock:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    time.sleep(2)
+                    continue
+                with wandb.init(**job["wandb"], resume="allow", dir=str(directory)) as run:
+                    publish(run, output)
+                break
     return results
+
+
+def initialize_panels(run, datasets, models):
+    """Create the classifier section at startup, before scores are available."""
+    import wandb
+    from matplotlib import pyplot as plt
+
+    run.define_metric("tokenizer_step", hidden=True)
+    run.define_metric("classifier/*", step_metric="tokenizer_step", summary="none")
+    panels = {}
+    for dataset in datasets:
+        for model in models:
+            for metric in ("cross_entropy", "balanced_accuracy"):
+                key = "classifier/" + f"{dataset}_{model}_{metric}".replace("/", "_")
+                if run.summary.get(key) is not None:
+                    continue  # Resuming must preserve existing evaluation curves.
+                figure, axis = plt.subplots(figsize=(9, 5), layout="constrained")
+                try:
+                    axis.set_axis_off()
+                    axis.set_title(f"{dataset}: {model} {metric.replace('_', ' ')}")
+                    axis.text(0.5, 0.5, "Awaiting first classifier evaluation",
+                              ha="center", va="center", transform=axis.transAxes)
+                    panels[key] = wandb.Image(figure, caption="Pending evaluation; no classifier scores yet")
+                finally:
+                    plt.close(figure)
+    if panels:
+        run.log(panels)
+    print(f"Classifier section initialized before evaluation: {len(panels)} pending panels", flush=True)
+
+
+def publish(run, output, *, force=False):
+    """Publish grouped image panels, matching reconstruction's W&B media format.
+
+    force redraws existing results after a presentation change without refitting.
+    """
+    import wandb
+    from matplotlib import pyplot as plt
+
+    output = Path(output)
+    paths = list(output.glob("*/step_*/metrics.json"))
+    if not paths:
+        return
+    path = max(paths, key=lambda p: (p.parent.name, p.parent.parent.name))
+    results = json.loads(path.read_text())
+    logged = output / "logged_step.txt"
+    if not force and logged.exists() and int(logged.read_text()) >= results["tokenizer_step"]:
+        return
+    job = json.loads((path.parent / "job.json").read_text())
+    history = {}
+    for path in sorted(output.glob("*/step_*/metrics.json")):
+        previous = json.loads(path.read_text())
+        if "tokenizer_step" in previous:
+            history[previous["tokenizer_step"]] = previous["datasets"]
+    run.define_metric("tokenizer_step", hidden=True)
+    run.define_metric("classifier/*", step_metric="tokenizer_step", summary="none")
+    panels = {"tokenizer_step": results["tokenizer_step"]}
+    plot_dir = output / "plots" / f"step_{results['tokenizer_step']:08d}"
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    for dataset in job["datasets"]:
+        for model in job["models"]:
+            steps = sorted(int(s) for s, row in history.items()
+                           if "test" in row.get(dataset, {}).get(model, {}))
+            if not steps:
+                continue
+            series = {"tokenizer": [history[s][dataset][model] for s in steps]}
+            series.update({source: [results["baselines"][dataset][source.lower()][model]] * len(steps)
+                           for source in ("TFM", "LaBraM")})
+            for metric in ("cross_entropy", "balanced_accuracy"):
+                figure, axis = plt.subplots(figsize=(9, 5), layout="constrained")
+                for (source, scores), color in zip(series.items(), ("#0072B2", "#E69F00", "#009E73")):
+                    splits = ("train", "val", "test") if source == "tokenizer" else ("test",)
+                    for split in splits:
+                        axis.plot(steps, [row[split][metric] for row in scores],
+                                  label=f"{source}/{split}", color=color, marker="o", markersize=3,
+                                  linestyle={"train": "-", "val": "--", "test": ":"}[split])
+                axis.set(title=f"{dataset}: {model} {metric.replace('_', ' ')}",
+                         xlabel="Tokenizer step", ylabel=metric.replace("_", " "))
+                axis.grid(alpha=0.2)
+                axis.legend(fontsize="small")
+                # One slash keeps every chart in the classifier section, even
+                # when the workspace groups panels by their last prefix.
+                name = f"{dataset}_{model}_{metric}".replace("/", "_")
+                try:
+                    figure.savefig(plot_dir / f"{name}.png", dpi=160)
+                    panels[f"classifier/{name}"] = wandb.Image(
+                        figure, caption=f"{dataset}: {model}, tokenizer step {results['tokenizer_step']}"
+                    )
+                finally:
+                    plt.close(figure)
+    run.log(panels)
+    save_json(logged, results["tokenizer_step"])
 
 
 if __name__ == "__main__":

@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -16,6 +16,28 @@ from evals.data import load_tokens, sha256
 
 
 class ClassifierTests(unittest.TestCase):
+    def test_startup_panels_before_results_and_resume(self):
+        from wandb.sdk.wandb_summary import Summary
+
+        run = MagicMock()
+        summary = {}
+        run.summary = Summary(lambda: summary)
+        datasets = {"depression": "/missing", "ssvep": "/also-missing"}
+        classify.initialize_panels(run, datasets, ["transformer"])
+        panels = run.log.call_args.args[0]
+        self.assertEqual(set(panels), {f"classifier/{d}_transformer_{m}"
+            for d in datasets for m in ("cross_entropy", "balanced_accuracy")})
+        self.assertTrue(all(p._log_type == "image-file" for p in panels.values()))
+        self.assertTrue(all("Pending evaluation" in p._caption for p in panels.values()))
+        self.assertNotIn("tokenizer_step", panels)  # No fabricated evaluation step or scores.
+        summary.update(panels)
+        run.reset_mock()
+        classify.initialize_panels(run, datasets, ["transformer"])
+        run.log.assert_not_called()  # Preserve curves on resume.
+        summary.clear()
+        classify.initialize_panels(run, datasets, [])
+        run.log.assert_not_called()
+
     def setUp(self):
         torch.set_num_threads(2)
         torch.manual_seed(33)
@@ -57,7 +79,7 @@ class ClassifierTests(unittest.TestCase):
         with patch.dict(os.environ, CUDA_VISIBLE_DEVICES="7", RANK="3", SBATCH_GPUS="8"), \
                 patch.object(classify.subprocess, "run", return_value=SimpleNamespace(stdout="123\n")) as launch:
             for step in range(5):
-                classify.submit(self.model, step, self.output, {}, None, 2, ["--gpus=1"], self.datasets, config=self.config)
+                classify.submit(self.model, step, self.output, {}, None, 2, ["--gpus=1"], self.datasets, config=self.config, gpu="slurm")
                 with torch.no_grad():
                     self.model.encoder.patch_projection.bias.add_(1)
             self.assertEqual(launch.call_count, 3)
@@ -71,27 +93,27 @@ class ClassifierTests(unittest.TestCase):
                 blob = torch.load(path / "weights.pth", weights_only=False)
                 torch.testing.assert_close(blob["state_dict"]["encoder.patch_projection.bias"], original + step)
                 self.assertEqual(json.loads((path / "job.json").read_text())["step"], step)
-            classify.submit(self.model, 0, self.output, {}, None, 2, [], self.datasets, config=self.config)
-            classify.submit(self.model, 0, self.root / "disabled", {}, None, 0, [], self.datasets, config=self.config)
+            classify.submit(self.model, 0, self.output, {}, None, 2, [], self.datasets, config=self.config, gpu="slurm")
+            classify.submit(self.model, 0, self.root / "disabled", {}, None, 0, [], self.datasets, config=self.config, gpu="slurm")
             self.assertEqual(launch.call_count, 3)
             self.assertFalse((self.root / "disabled").exists())
             job_name = next(a for a in call.args[0] if a.startswith("--job-name="))
-            classify.submit(self.model, 0, self.output.with_name("resumed"), {}, None, 2, [], self.datasets, config=self.config)
+            classify.submit(self.model, 0, self.output.with_name("resumed"), {}, None, 2, [], self.datasets, config=self.config, gpu="slurm")
             self.assertIn(job_name, launch.call_args.args[0])
             classify.submit(self.model, 0, self.root / "other/evals/launch", {}, None, 2, [], self.datasets,
-                            "/eval/python", config=self.config)
+                            "/eval/python", config=self.config, gpu="slurm")
             self.assertNotIn(job_name, launch.call_args.args[0])
             self.assertTrue(launch.call_args.args[0][-1].startswith("/eval/python "))
 
     def test_submission_failure_retains_retryable_snapshot(self):
         with patch.object(classify.subprocess, "run", side_effect=subprocess.TimeoutExpired("sbatch", 15)):
             with self.assertWarns(RuntimeWarning):
-                classify.submit(self.model, 0, self.output, {}, None, 1, [], self.datasets, config=self.config)
+                classify.submit(self.model, 0, self.output, {}, None, 1, [], self.datasets, config=self.config, gpu="slurm")
         path = self.output / "step_00000000"
         digest = sha256(path / "weights.pth")
         self.assertFalse((path / "job_id.txt").exists())
         with patch.object(classify.subprocess, "run", return_value=SimpleNamespace(stdout="124\n")):
-            classify.submit(self.model, 0, self.output, {}, None, 1, [], self.datasets, config=self.config)
+            classify.submit(self.model, 0, self.output, {}, None, 1, [], self.datasets, config=self.config, gpu="slurm")
         self.assertEqual(sha256(path / "weights.pth"), digest)
         self.assertEqual((path / "job_id.txt").read_text().strip(), "124")
 
@@ -126,25 +148,31 @@ class ClassifierTests(unittest.TestCase):
                                  group="", url="https://example.com/parent")
         with patch.object(classify.subprocess, "run", return_value=SimpleNamespace(stdout="123\n")):
             classify.submit(self.model, 0, self.output, {}, parent, 1, [],
-                            {**self.datasets, "second": str(self.root)}, token_cache=self.token_cache, config=config)
+                            {**self.datasets, "second": str(self.root)}, token_cache=self.token_cache, config=config, gpu="slurm")
         path = self.output / "step_00000000"
         job = json.loads((path / "job.json").read_text())
         self.assertEqual(job["transformer"]["heads"], 2)
         self.assertEqual(config["transformer"], job["transformer"])
         classify.save_json(path / "metrics.json", {"datasets": {"fixture": {
             "transformer": {"balanced_accuracy": 0.5}}}})  # Old validation-only results need recomputing.
-        with patch("wandb.init") as init, patch("wandb.plot.line_series") as plots, \
+        with patch.dict(os.environ, WANDB_SERVICE="3-0-unix-/tmp/missing-wandb"), \
+                patch("wandb.init") as init, patch("wandb.Image", side_effect=lambda figure, **kwargs: figure) as plots, \
                 patch("evals.models.transformer_classifier.TransformerClassifier", wraps=TransformerClassifier) as model:
             results = classify.evaluate(path, device="cpu")
+            self.assertNotIn("WANDB_SERVICE", os.environ)
             for call in model.call_args_list:
                 self.assertEqual(call.kwargs["model_dim"], 16)
                 self.assertEqual(call.kwargs["codebook_dim"], 2)
-            self.assertEqual(init.call_args.kwargs["config"]["classifier_config"], config)
-            self.assertTrue(init.call_args.kwargs["id"].startswith("parent-classifiers-"))
+            self.assertEqual(init.call_args.kwargs["id"], parent.id)
+            self.assertEqual(init.call_args.kwargs["mode"], "online")
+            self.assertNotIn("config", init.call_args.kwargs)  # Preserve the training run's configuration.
             logged = init.return_value.__enter__.return_value.log.call_args.args[0]
             self.assertEqual(logged["tokenizer_step"], 0)
             self.assertEqual(len(logged), 9)  # Step plus two panels per dataset/classifier.
-            self.assertIn("classifier/second/transformer/cross_entropy", logged)
+            self.assertIn("classifier/second_transformer_cross_entropy", logged)
+            self.assertTrue(all(key.count("/") == 1 for key in logged if key != "tokenizer_step"))
+            init.return_value.__enter__.return_value.define_metric.assert_any_call(
+                "classifier/*", step_metric="tokenizer_step", summary="none")
         self.assertEqual(set(results["datasets"]), {"fixture", "second"})
         self.assertEqual({p.name for p in path.rglob("*")
                           if p.suffix in (".pt", ".pth", ".npy", ".npz")}, {"weights.pth"})
@@ -154,34 +182,55 @@ class ClassifierTests(unittest.TestCase):
                 self.assertEqual(metrics[split]["n_examples"], 2)
                 self.assertEqual(len(metrics[split]["confusion_matrix"]), 2)
         with patch.object(classify, "fit", side_effect=AssertionError("must reuse results")), \
-                patch("wandb.init"), patch("wandb.plot.line_series"):
+                patch("wandb.init") as init, patch("wandb.Image"):
             self.assertEqual(classify.evaluate(path, device="cpu"), results)
+            init.assert_not_called()  # Already published by the active writer.
+        # A presentation-only repair must reuse results and serialize as image
+        # media, the same type used by reconstruction's automatic panels.
+        with patch.object(classify, "fit", side_effect=AssertionError("must reuse results")):
+            run = MagicMock()
+            classify.publish(run, self.output.parent, force=True)
+            repaired = run.log.call_args.args[0]
+            images = [value for key, value in repaired.items() if key.startswith("classifier/")]
+            self.assertEqual(len(images), 8)
+            self.assertTrue(all(value._log_type == "image-file" for value in images))
+            self.assertEqual(len(list((self.output.parent / "plots/step_00000000").glob("*.png"))), 8)
+            run.reset_mock()
+            classify.publish(run, self.output.parent)
+            run.log.assert_not_called()
         with patch.object(classify.subprocess, "run", return_value=SimpleNamespace(stdout="124\n")):
             classify.submit(self.model, 2, self.output, {}, parent, 1, [],
-                            {**self.datasets, "second": str(self.root)}, token_cache=self.token_cache, config=config)
+                            {**self.datasets, "second": str(self.root)}, token_cache=self.token_cache, config=config, gpu="slurm")
         second = self.output / "step_00000002"
         self.assertEqual(json.loads((second / "job.json").read_text())["wandb"]["id"], job["wandb"]["id"])
-        classify.save_json(self.output.parent / f"history-{job['wandb']['id']}.json",
-                           {"0": results["datasets"], "1": {"fixture": {
+        classify.save_json(self.output / "step_00000001/metrics.json",
+                           {"tokenizer_step": 1, "datasets": {"fixture": {
                                "transformer": {"balanced_accuracy": 0.5}}}})
         with patch.object(classify, "fit", wraps=classify.fit) as fit, \
-                patch("wandb.init"), patch("wandb.plot.line_series") as plots:
+                patch("wandb.init") as init, patch("wandb.Image") as plots, \
+                patch.object(classify.fcntl, "flock", side_effect=BlockingIOError), \
+                patch.object(classify.time, "sleep", side_effect=lambda _: classify.publish(MagicMock(), self.output.parent)):
             later = classify.evaluate(second, device="cpu")
+            init.assert_not_called()  # Trainer publishes while holding the run lock.
             self.assertEqual(fit.call_count, 2)  # Only the two current-tokenizer datasets train again.
             for call in plots.call_args_list:
-                self.assertEqual(call.args[0], [0, 2])
-                self.assertEqual(len(call.args[1]), 9)  # Three splits for each tokenizer.
-                self.assertEqual(call.kwargs["keys"][:3], ["tokenizer/train", "tokenizer/val", "tokenizer/test"])
-                for reference in call.args[1][3:]:
-                    self.assertEqual(reference[0], reference[1])
-            self.assertEqual(plots.call_args_list[0].args[1][:3],
+                traces = call.args[0].axes[0].lines
+                self.assertEqual(len(traces), 5)  # Tokenizer splits plus test-only references.
+                self.assertTrue(all(list(t.get_xdata()) == [0, 2] for t in traces))
+                self.assertEqual([t.get_label() for t in traces[:3]], ["tokenizer/train", "tokenizer/val", "tokenizer/test"])
+                self.assertEqual([t.get_label() for t in traces[3:]], ["TFM/test", "LaBraM/test"])
+                self.assertEqual(len({t.get_color() for t in traces}), 3)
+                self.assertEqual([t.get_linestyle() for t in traces], ["-", "--", ":", ":", ":"])
+                for reference in traces[3:]:
+                    self.assertEqual(reference.get_ydata()[0], reference.get_ydata()[1])
+            self.assertEqual([list(t.get_ydata()) for t in plots.call_args_list[0].args[0].axes[0].lines[:3]],
                 [[r["datasets"]["fixture"]["transformer"][s]["cross_entropy"] for r in (results, later)]
                  for s in ("train", "val", "test")])
         with patch.object(classify.subprocess, "run", return_value=SimpleNamespace(stdout="125\n")):
             classify.submit(self.model, 4, self.output, {}, parent, 1, [], self.datasets,
-                            token_cache=self.token_cache, config={**config, "learning_rate": 0.003})
+                            token_cache=self.token_cache, config={**config, "learning_rate": 0.003}, gpu="slurm")
         changed = json.loads((self.output / "step_00000004/job.json").read_text())
-        self.assertNotEqual(changed["wandb"]["id"], job["wandb"]["id"])
+        self.assertEqual(changed["wandb"]["id"], parent.id)
 
     def test_baseline_config_reuse(self):
         job = {**self.config, "models": ["transformer", "bag_of_tokens"],
@@ -243,7 +292,7 @@ class ClassifierTests(unittest.TestCase):
 
     def test_classifier_selection(self):
         with patch.object(classify.subprocess, "run") as launch:
-            classify.submit(self.model, 0, self.output, {}, None, 1, [], self.datasets, models=[], config=self.config)
+            classify.submit(self.model, 0, self.output, {}, None, 1, [], self.datasets, models=[], config=self.config, gpu="slurm")
             launch.assert_not_called()
             self.assertFalse(self.output.exists())
         for name in ("transformer", "bag_of_tokens"):
@@ -251,14 +300,29 @@ class ClassifierTests(unittest.TestCase):
             parent = SimpleNamespace(project="test", entity="test", id=name, name=name, group="", url="")
             with patch.object(classify.subprocess, "run", return_value=SimpleNamespace(stdout="123\n")):
                 classify.submit(self.model, 0, output, {}, parent, 1, [], self.datasets,
-                                models=[name], token_cache=self.token_cache, config=self.config)
+                                models=[name], token_cache=self.token_cache, config=self.config, gpu="slurm")
             path = output / "step_00000000"
             job = json.loads((path / "job.json").read_text())
             job["epochs"] = 1
             classify.save_json(path / "job.json", job)
-            with patch("wandb.init") as init, patch("wandb.plot.line_series"):
+            with patch("wandb.init") as init, patch("wandb.Image"):
                 result = classify.evaluate(path, device="cpu")
                 panels = init.return_value.__enter__.return_value.log.call_args.args[0]
-                self.assertEqual(set(panels), {"tokenizer_step", f"classifier/fixture/{name}/cross_entropy",
-                                              f"classifier/fixture/{name}/balanced_accuracy"})
+                self.assertEqual(set(panels), {"tokenizer_step", f"classifier/fixture_{name}_cross_entropy",
+                                              f"classifier/fixture_{name}_balanced_accuracy"})
                 self.assertEqual(set(result["datasets"]["fixture"]), {name})
+
+    def test_local_gpu_selection(self):
+        with patch.dict(os.environ, CUDA_VISIBLE_DEVICES="GPU-tokenizer", RANK="3"), \
+                patch.object(classify.subprocess, "Popen", return_value=SimpleNamespace(pid=123)) as launch:
+            for step, options, expected in ((0, {}, "GPU-tokenizer"), (2, {"gpu": "5"}, "5")):
+                classify.submit(self.model, step, self.output, {}, None, 1, [], self.datasets,
+                                config=self.config, **options)
+                call = launch.call_args
+                self.assertEqual(call.kwargs["env"]["CUDA_VISIBLE_DEVICES"], expected)
+                self.assertNotIn("RANK", call.kwargs["env"])
+                self.assertTrue(call.kwargs["start_new_session"])
+                self.assertEqual(call.args[0][:3], ["flock", "-F", str(self.output.parent / "classifier.lock")])
+                path = self.output / f"step_{step:08d}"
+                self.assertEqual(json.loads((path / "job.json").read_text())["gpu"], expected)
+                self.assertEqual((path / "job_id.txt").read_text().strip(), "local:123")

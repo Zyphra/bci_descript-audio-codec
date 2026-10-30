@@ -1,0 +1,10 @@
+# Preserve the tokenizer recipe; evaluate the transformer classifier in parallel.
+$include:
+  - conf/k8moss_start_shorter.yml
+
+save_path: runs/k8moss_start_shorter_classifier_gpu6
+WandB.name: k8moss_start_shorter_classifier_gpu6
+tokenizer_gpu: '6'
+classifier_gpu: same
+classifier_models: [transformer]
+classifier_every: 5000

@@ -1,10 +1,13 @@
 """Train EEG with JRH's optional k8MOSS transformer or convolutional DAC.
 
 Uses the CW training path with architecture selection and shared RVQ settings.
-Classifiers run in separate Slurm jobs at step 0 and every classifier_every updates
-(default 5000; 0 disables). classifier_sbatch sets resources; classifier_python
-selects an environment with this repo and its [eval] extra installed. Snapshots and
-metrics live in save_path/evals; W&B uses a linked classifier run.
+Classifiers run in separate processes at step 0 and every classifier_every updates
+(default 5000; 0 disables). tokenizer_gpu selects a GPU index/UUID (empty preserves CUDA_VISIBLE_DEVICES).
+classifier_gpu defaults to 'same', accepts another index/UUID, or 'slurm' with classifier_sbatch resources.
+classifier_python selects an environment with this repo and its [eval] extra installed. Snapshots and
+metrics live in save_path/evals; classifiers log to the training W&B run.
+The classifier section contains cross-entropy and balanced-accuracy image panels
+per dataset/model, with tokenizer train/val/test curves and test-only baselines.
 classifier_datasets maps metric names to EEG cache directories containing cache.json.
 classifier_models selects transformer/bag_of_tokens (an empty list disables evaluation).
 classifier_config sets training settings and transformer/bag_of_tokens constructor options;
@@ -49,7 +52,7 @@ from dac.utils.provenance import create_launch_record, link_wandb_launch
 from dac.utils.wandb_resume import prepare_wandb_run
 from dac.utils.codebook_charts import wandb_summary_charts
 from dac.utils.model_selection import SHARED_SETTINGS, build_generator, load_generator
-from evals.classify import submit as submit_classifiers
+from evals.classify import initialize_panels as initialize_classifier_panels, publish as publish_classifiers, submit as submit_classifiers
 from dac.utils.gradient_diagnostics import (
     GENERATOR_CLIP_NORM,
     GradientDiagnostics as GradientMonitor,
@@ -1036,6 +1039,8 @@ def train(
     save_iters: list = [10000, 50000, 100000, 200000],
     sample_freq: int = 10000,
     valid_freq: int = 1000,
+    tokenizer_gpu: str = "",
+    classifier_gpu: str = "same",
     classifier_every: int = 5000,  # 0 disables classifiers
     classifier_python: str = sys.executable,
     classifier_models: list = ["transformer", "bag_of_tokens"],
@@ -1169,6 +1174,12 @@ def train(
                               if key != "quantizer_dropout"})
             used_args["DAC.quantizer_dropout"] = model.quantizer.quantizer_dropout
             argbind.dump_args(used_args, launch / "config_used.yml")
+            if classifier_models and classifier_every and wandb_config["enabled"]:
+                import fcntl
+                evaluation_root = Path(save_path) / "evals"
+                evaluation_root.mkdir(parents=True, exist_ok=True)
+                lock = stack.enter_context((evaluation_root / "wandb.lock").open("a"))
+                fcntl.flock(lock, fcntl.LOCK_EX)
             wandb, wandb_run = initialize_wandb(
                 wandb_config, args, Path(save_path), accel.unwrap(state.generator)
             )
@@ -1176,6 +1187,8 @@ def train(
                 stack.enter_context(managed_wandb_run(
                     wandb, wandb_run, wandb_config["interrupt_timeout"]
                 ))
+                if classifier_models and classifier_every:
+                    initialize_classifier_panels(wandb_run, classifier_datasets, classifier_models)
                 link_wandb_launch(launch, wandb_run)
                 if writer is not None:
                     # Flush TensorBoard before a possible forced W&B exit.
@@ -1188,7 +1201,8 @@ def train(
             # Capture untrained weights before the first forward/backward; evaluation is asynchronous.
             submit_classifiers(model, tracker.step, classifier_output, args, wandb_run,
                                classifier_every, classifier_sbatch, classifier_datasets, classifier_python,
-                               models=classifier_models, token_cache=classifier_token_cache, config=classifier_config)
+                               models=classifier_models, token_cache=classifier_token_cache,
+                               config=classifier_config, gpu=classifier_gpu)
         train_codebook_counts = torch.zeros(
             model.n_codebooks, model.codebook_size, dtype=torch.long, device=accel.device
         )
@@ -1203,11 +1217,14 @@ def train(
                     submit_classifiers(model, tracker.step + 1, classifier_output,
                                        args, wandb_run, classifier_every, classifier_sbatch,
                                        classifier_datasets, classifier_python,
-                                       models=classifier_models, token_cache=classifier_token_cache, config=classifier_config)
+                                       models=classifier_models, token_cache=classifier_token_cache,
+                                       config=classifier_config, gpu=classifier_gpu)
 
                 last_iter = (
                     tracker.step == num_iters - 1 if num_iters is not None else False
                 )
+                if wandb_run is not None and classifier_models and classifier_every and (tracker.step % 100 == 0 or last_iter):
+                    publish_classifiers(wandb_run, classifier_output.parent)
                 log_training_metrics(
                     output, tracker.step,
                     normal_due=tracker.step % wandb_config["log_freq"] == 0 or last_iter,
@@ -1258,6 +1275,9 @@ def train(
 
 if __name__ == "__main__":
     args = argbind.parse_args()
+    if args["tokenizer_gpu"] != "" and os.environ.get("CUDA_VISIBLE_DEVICES") != str(args["tokenizer_gpu"]):
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(args["tokenizer_gpu"])
+        os.execv(sys.executable, [sys.executable, *sys.argv])  # Apply the GPU mask before torch imports.
     args["args.debug"] = int(os.getenv("LOCAL_RANK", 0)) == 0
     with argbind.scope(args):
         with Accelerator() as accel:
